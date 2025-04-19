@@ -36,8 +36,16 @@ export const OPENAI_TIMEOUT_MS =
 export const OPENAI_BASE_URL = process.env["OPENAI_BASE_URL"] || "";
 export let OPENAI_API_KEY = process.env["OPENAI_API_KEY"] || "";
 
+// Anthropic API configuration
+export const ANTHROPIC_BASE_URL = process.env["ANTHROPIC_BASE_URL"] || "";
+export let ANTHROPIC_API_KEY = process.env["ANTHROPIC_API_KEY"] || "";
+
 export function setApiKey(apiKey: string): void {
   OPENAI_API_KEY = apiKey;
+}
+
+export function setAnthropicApiKey(apiKey: string): void {
+  ANTHROPIC_API_KEY = apiKey;
 }
 
 // Formatting (quiet mode-only).
@@ -73,6 +81,9 @@ export type MemoryConfig = {
 // Represents full runtime config, including loaded instructions.
 export type AppConfig = {
   apiKey?: string;
+  anthropicApiKey?: string;
+  openaiBaseUrl?: string;
+  anthropicBaseUrl?: string;
   model: string;
   instructions: string;
   fullAutoErrorMode?: FullAutoErrorMode;

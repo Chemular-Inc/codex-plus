@@ -1,8 +1,19 @@
 import { OPENAI_API_KEY } from "./config";
 import OpenAI from "openai";
+import { detectProviderFromModel, ModelProvider } from "./model-providers/index.js";
 
 const MODEL_LIST_TIMEOUT_MS = 2_000; // 2 seconds
 export const RECOMMENDED_MODELS: Array<string> = ["o4-mini", "o3"];
+export const SUPPORTED_CLAUDE_MODELS: Array<string> = [
+  "claude-3-opus-20240229",
+  "claude-3-sonnet-20240229", 
+  "claude-3-haiku-20240307",
+  "claude-3-7-sonnet-20250219",
+  "claude-3.5-sonnet-20240620",
+  "claude-3",
+  "claude-3.5",
+  "claude-3.7"
+];
 
 /**
  * Background model loader / cache.
@@ -54,8 +65,9 @@ export async function getAvailableModels(): Promise<Array<string>> {
 
 /**
  * Verify that the provided model identifier is present in the set returned by
- * {@link getAvailableModels}. The list of models is fetched from the OpenAI
- * `/models` endpoint the first time it is required and then cached in‑process.
+ * {@link getAvailableModels} or is a supported Claude model.
+ * The list of models is fetched from the OpenAI `/models` endpoint the first time 
+ * it is required and then cached in‑process.
  */
 export async function isModelSupportedForResponses(
   model: string | undefined | null,
@@ -67,7 +79,16 @@ export async function isModelSupportedForResponses(
   ) {
     return true;
   }
+  
+  // Check if this is a Claude model
+  const provider = detectProviderFromModel(model);
+  if (provider === ModelProvider.ANTHROPIC) {
+    // Either it's in our supported list or we'll trust it if it has "claude" in the name
+    return SUPPORTED_CLAUDE_MODELS.includes(model) || 
+           model.toLowerCase().includes("claude");
+  }
 
+  // For OpenAI models, check against the API
   try {
     const models = await Promise.race<Array<string>>([
       getAvailableModels(),
