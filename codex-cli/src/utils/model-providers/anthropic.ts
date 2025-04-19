@@ -262,11 +262,15 @@ class AnthropicClient {
                 type: "enabled",
                 budget_tokens: options.thinking.budgetTokens 
               };
+              // When thinking is enabled, temperature MUST be set to 1
+              requestBody.temperature = 1;
             } else {
               requestBody.thinking = { 
                 type: "enabled",
                 budget_tokens: 3000 // Default token budget
               };
+              // When thinking is enabled, temperature MUST be set to 1
+              requestBody.temperature = 1;
             }
           }
           
