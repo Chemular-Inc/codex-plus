@@ -97,7 +97,40 @@ function mapAnthropicResponseToOpenAI(
 ): Array<ResponseItem> {
   const responseItems: Array<ResponseItem> = [];
   
-  // Map the main message content
+  // First process tool calls so they appear before the message content in the response
+  // This is important because the agent loop processes items in order
+  if (anthropicResponse.tool_uses && anthropicResponse.tool_uses.length > 0) {
+    for (const toolUse of anthropicResponse.tool_uses) {
+      // Create function call item
+      const functionCallItem: ResponseItem = {
+        id: toolUse.id,
+        type: "function_call",
+        name: toolUse.name,
+        call_id: toolUse.id,
+        arguments: JSON.stringify(toolUse.input),
+      };
+      
+      // For shell commands, make sure the argument format is compatible
+      if (toolUse.name === "shell" && typeof toolUse.input === "object") {
+        // If command is a string, convert it to array format that OpenAI expects
+        const input = toolUse.input as any;
+        if (typeof input.command === "string") {
+          const commandArgs = input.command.split(/\s+/).filter(Boolean);
+          if (commandArgs.length > 0) {
+            const newArguments = {
+              ...input,
+              command: commandArgs
+            };
+            functionCallItem.arguments = JSON.stringify(newArguments);
+          }
+        }
+      }
+      
+      responseItems.push(functionCallItem);
+    }
+  }
+  
+  // Map the main message content after tool calls
   if (anthropicResponse.content) {
     const messageItem: ResponseItem = {
       id: `${conversationId}-message`,
@@ -118,19 +151,17 @@ function mapAnthropicResponseToOpenAI(
     responseItems.push(messageItem);
   }
   
-  // Map tool calls to function_call format
-  if (anthropicResponse.tool_uses) {
-    for (const toolUse of anthropicResponse.tool_uses) {
-      const functionCallItem: ResponseItem = {
-        id: toolUse.id,
-        type: "function_call",
-        name: toolUse.name,
-        call_id: toolUse.id,
-        arguments: JSON.stringify(toolUse.input),
-      };
-      
-      responseItems.push(functionCallItem);
-    }
+  // Ensure we always have at least an empty message if nothing else
+  if (responseItems.length === 0) {
+    responseItems.push({
+      id: `${conversationId}-empty`,
+      type: "message",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "I'll help with that.",
+      }]
+    });
   }
   
   return responseItems;
@@ -208,14 +239,38 @@ class AnthropicClient {
             requestBody.system = options.system;
           }
           
-          // Add tools if provided
-          if (options?.tools && options.tools.length > 0) {
-            requestBody.tools = options.tools;
-          }
+          // IMPORTANT: Always include the shell tool for Claude models
+          // This ensures tool calls are properly handled
+          requestBody.tools = [
+            {
+              name: "shell",
+              description: "Runs a shell command, and returns its output.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  command: { 
+                    type: "string", 
+                    description: "The command to execute. Can include arguments."
+                  },
+                  workdir: {
+                    type: "string",
+                    description: "The working directory for the command.",
+                  },
+                  timeout: {
+                    type: "number",
+                    description: "The maximum time to wait for the command to complete in milliseconds.",
+                  },
+                },
+                required: ["command"],
+              },
+            }
+          ];
+          
+          // Always set tool_choice to auto to encourage model to use tools
+          requestBody.tool_choice = "auto";
           
           // Add tool results if available
           if (toolResults.length > 0 || (options?.toolResults && options.toolResults.length > 0)) {
-            requestBody.tool_choice = "auto";
             requestBody.tool_results = [
               ...(options?.toolResults || []),
               ...toolResults,
@@ -289,12 +344,14 @@ class AnthropicClient {
         {
           estimatedTokens,
           // Configure timeout for Anthropic requests
-          timeoutMs: 60000, // 60 second timeout for Claude
+          timeoutMs: 120000, // 120 second timeout for Claude (same as OpenAI)
           onRateLimitEncountered: (delayMs, attempt) => {
             log(`Anthropic rate limit encountered: waiting ${Math.round(delayMs / 1000)}s before attempt ${attempt}`);
             
-            // Don't throw here - the rate limiter will handle retrying automatically 
-            // and we'll let the executeWithRateLimiting function manage the retries
+            // Mimic OpenAI's error handling for consistency
+            if (attempt > 0) {
+              throw new Error(`⏳ Rate limit reached. Automatically retrying in ${Math.round(delayMs / 1000)} seconds... (Attempt ${attempt})`);
+            }
           },
           onFinalFailure: (error) => {
             log(`Anthropic API error after all retries: ${JSON.stringify(error)}`);
@@ -490,16 +547,40 @@ class AnthropicProvider implements ModelProviderInterface {
       // Make sure client is initialized
       await this.initializeClient();
       
-      return this.client.sendMessage(input, {
+      if (isLoggingEnabled()) {
+        log(`Anthropic provider sending message with model: ${this.model}`);
+        log(`Input contains ${input.length} items`);
+        if (options.system) {
+          log(`System prompt length: ${options.system.length}`);
+        }
+      }
+      
+      // Pass conversation ID from previousResponseId if available
+      const conversationId = options.previousResponseId ? 
+        options.previousResponseId : 
+        options.conversationId || `conv_${Date.now()}`;
+      
+      const result = await this.client.sendMessage(input, {
         model: this.model,
         system: options.system,
-        temperature: options.temperature,
-        conversationId: options.conversationId,
+        temperature: options.temperature || 0.7,
+        conversationId: conversationId,
+        // Always include shell tool to match OpenAI capability
         tools: this.client.getToolsForCodex(),
       });
+      
+      if (isLoggingEnabled()) {
+        log(`Anthropic response contains ${result.items.length} items`);
+        const toolCalls = result.items.filter(item => item.type === "function_call").length;
+        if (toolCalls > 0) {
+          log(`Response includes ${toolCalls} tool calls`);
+        }
+      }
+      
+      return result;
     } catch (error) {
       if (isLoggingEnabled()) {
-        log(`Error in Anthropic provider: ${error}`);
+        log(`Error in Anthropic provider: ${error instanceof Error ? error.message : String(error)}`);
       }
       throw error;
     }
