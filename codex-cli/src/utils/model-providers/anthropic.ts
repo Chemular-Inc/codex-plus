@@ -208,6 +208,19 @@ class AnthropicClient {
     
     // Call Anthropic API with rate limiting
     try {
+      // Debug logging to trace conversation context issues
+      if (isLoggingEnabled()) {
+        log(`Claude conversation context - messages: ${messages.length}`);
+        const userMsgs = messages.filter(m => m.role === 'user').length;
+        const assistantMsgs = messages.filter(m => m.role === 'assistant').length;
+        log(`Message breakdown - user: ${userMsgs}, assistant: ${assistantMsgs}`);
+        
+        // Log any tool results being sent
+        if (toolResults.length > 0) {
+          log(`Tool results being sent: ${toolResults.length}`);
+        }
+      }
+      
       // More accurate token estimation (Anthropic-specific)
       // This is a better approximation for Claude models
       const estimatedTokens = this.estimateTokenCount(messages, options?.system);
@@ -236,7 +249,16 @@ class AnthropicClient {
           
           // Add system instruction if provided
           if (options?.system) {
-            requestBody.system = options.system;
+            // Enhance system prompt for Claude to encourage tool usage
+            const toolUsageInstructions = `
+IMPORTANT: You MUST use the shell tool to explore files, run commands, and interact with the filesystem.
+When asked to look at code, search for files, or perform any operations:
+1. ALWAYS use the shell tool
+2. NEVER say you'll do something without actually doing it
+3. MAINTAIN context between messages
+4. EXECUTE commands before responding substantively
+`;
+            requestBody.system = `${options.system}\n\n${toolUsageInstructions}`;
           }
           
           // IMPORTANT: Always include the shell tool for Claude models
@@ -267,7 +289,8 @@ class AnthropicClient {
           ];
           
           // Set tool_choice as object per Anthropic API requirements
-          requestBody.tool_choice = { type: "auto" };
+          // Force tool usage by setting to a more assertive value
+          requestBody.tool_choice = { type: "any" };
           
           // Add tool results if available
           if (toolResults.length > 0 || (options?.toolResults && options.toolResults.length > 0)) {
