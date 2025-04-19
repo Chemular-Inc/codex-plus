@@ -21,6 +21,10 @@ import {
 import { handleExecCommand } from "./handle-exec-command.js";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
+import { ModelProvider, ModelProviderInterface, providerRegistry, detectProviderFromModel } from "../model-providers/index.js";
+
+// Add support for rate limiter
+import { executeWithRateLimiting } from "../rate-limiter.js";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
@@ -62,6 +66,7 @@ export class AgentLoop {
   private approvalPolicy: ApprovalPolicy;
   private config: AppConfig;
   private additionalWritableRoots: ReadonlyArray<string>;
+  private modelProvider: ModelProvider;
 
   // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
   // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
@@ -69,6 +74,10 @@ export class AgentLoop {
   // the OpenAI SDK types may not perfectly match. The `typeof OpenAI` pattern captures the
   // instance shape without resorting to `any`.
   private oai: OpenAI;
+  
+  // The provider instance that handles model-specific implementations
+  private provider: ModelProviderInterface | null = null;
+  private providerInitialized: Promise<void>;
 
   private onItem: (item: ResponseItem) => void;
   private onLoading: (loading: boolean) => void;
@@ -194,6 +203,32 @@ export class AgentLoop {
 
     this.cancel();
   }
+  
+  /**
+   * Initialize the provider instance
+   * This is called lazily when needed
+   */
+  private async initializeProvider(): Promise<void> {
+    if (this.provider) {
+      return; // Already initialized
+    }
+    
+    try {
+      if (isLoggingEnabled()) {
+        log(`Initializing provider for model ${this.model} (${this.modelProvider})`);
+      }
+      
+      // Get the appropriate provider implementation from the registry
+      this.provider = await providerRegistry.createProviderFromConfig(this.config);
+      
+      if (isLoggingEnabled()) {
+        log(`Provider initialized successfully: ${this.provider.provider}`);
+      }
+    } catch (error) {
+      log(`Error initializing provider: ${error instanceof Error ? error.message : String(error)}`);
+      throw error; // Re-throw to notify caller
+    }
+  }
 
   public sessionId: string;
   /*
@@ -223,6 +258,9 @@ export class AgentLoop {
     this.instructions = instructions;
     this.approvalPolicy = approvalPolicy;
 
+    // Detect provider from model name
+    this.modelProvider = detectProviderFromModel(model);
+
     // If no `config` has been provided we derive a minimal stub so that the
     // rest of the implementation can rely on `this.config` always being a
     // defined object.  We purposefully copy over the `model` and
@@ -240,7 +278,9 @@ export class AgentLoop {
     this.getCommandConfirmation = getCommandConfirmation;
     this.onLastResponseId = onLastResponseId;
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
-    // Configure OpenAI client with optional timeout (ms) from environment
+    
+    // Initialize both the OpenAI client for backward compatibility
+    // and our provider architecture for the future
     const timeoutMs = OPENAI_TIMEOUT_MS;
     const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
     this.oai = new OpenAI({
@@ -262,6 +302,9 @@ export class AgentLoop {
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
+    
+    // Start provider initialization in constructor
+    this.providerInitialized = this.initializeProvider();
 
     this.hardAbort = new AbortController();
 
@@ -481,11 +524,12 @@ export class AgentLoop {
           this.onLoading(false);
           return;
         }
-        // send request to openAI
+        // send request to model provider
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        
+        // Send request to the appropriate provider
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
@@ -507,42 +551,75 @@ export class AgentLoop {
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
             }
-            // eslint-disable-next-line no-await-in-loop
-            stream = await this.oai.responses.create({
-              model: this.model,
-              instructions: mergedInstructions,
-              previous_response_id: lastResponseId || undefined,
-              input: turnInput,
-              stream: true,
-              parallel_tool_calls: false,
-              reasoning,
-              tools: [
-                {
-                  type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: false,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
+            
+            // If we're using Claude or another non-OpenAI model, use the provider architecture
+            // Otherwise, fall back to direct OpenAI client for backward compatibility
+            if (this.modelProvider !== ModelProvider.OPENAI) {
+              // Make sure provider is initialized
+              await this.providerInitialized;
+              
+              if (!this.provider) {
+                throw new Error(`Provider not initialized for model ${this.model}`);
+              }
+              
+              // Providers don't support streaming yet, so we use the non-streaming API
+              const response = await this.provider.sendMessage(turnInput, {
+                system: mergedInstructions,
+                reasoning,
+                previousResponseId: lastResponseId || undefined,
+              });
+              
+              // Process the response
+              for (const item of response.items) {
+                stageItem(item);
+              }
+              
+              // Update response ID
+              lastResponseId = response.response_id;
+              this.onLastResponseId(response.response_id);
+              
+              // Clear turn input to exit the loop
+              turnInput = [];
+              break;
+            } else {
+              // Use direct OpenAI client for backward compatibility
+              // eslint-disable-next-line no-await-in-loop
+              stream = await this.oai.responses.create({
+                model: this.model,
+                instructions: mergedInstructions,
+                previous_response_id: lastResponseId || undefined,
+                input: turnInput,
+                stream: true,
+                parallel_tool_calls: false,
+                reasoning,
+                tools: [
+                  {
+                    type: "function",
+                    name: "shell",
+                    description: "Runs a shell command, and returns its output.",
+                    strict: false,
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        command: { type: "array", items: { type: "string" } },
+                        workdir: {
+                          type: "string",
+                          description: "The working directory for the command.",
+                        },
+                        timeout: {
+                          type: "number",
+                          description:
+                            "The maximum time to wait for the command to complete in milliseconds.",
+                        },
                       },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
-                      },
+                      required: ["command"],
+                      additionalProperties: false,
                     },
-                    required: ["command"],
-                    additionalProperties: false,
                   },
-                },
-              ],
-            });
-            break;
+                ],
+              });
+              break;
+            }
           } catch (error) {
             const isTimeout = error instanceof APIConnectionTimeoutError;
             // Lazily look up the APIConnectionError class at runtime to

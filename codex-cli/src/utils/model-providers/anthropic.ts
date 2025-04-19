@@ -1,0 +1,516 @@
+/**
+ * Anthropic Claude API integration for Codex CLI
+ * This module provides integration with Claude AI models
+ */
+
+import type { ResponseInputItem, ResponseItem } from "openai/resources/responses/responses.mjs";
+import { log, isLoggingEnabled } from "../agent/log.js";
+import { executeWithRateLimiting } from "../rate-limiter.js";
+import { isRateLimitError } from "../error-types.js";
+import { ModelProvider, ProviderOptions, ModelProviderInterface, providerRegistry } from "./provider-interface.js";
+
+// Types mirroring Anthropic API structures
+type AnthropicMessage = {
+  role: "user" | "assistant" | "system";
+  content: Array<AnthropicContent>;
+};
+
+type AnthropicContent = 
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
+type AnthropicTool = {
+  name: string;
+  description: string;
+  input_schema: object;
+};
+
+// Type for tool use structure from Anthropic API
+type AnthropicToolUse = {
+  id: string;
+  name: string;
+  input: object;
+};
+
+type AnthropicToolResult = {
+  tool_use_id: string;
+  output: string | object;
+};
+
+// Mapping function between OpenAI and Anthropic formats
+function mapOpenAIInputToAnthropic(
+  input: Array<ResponseInputItem>
+): { messages: Array<AnthropicMessage>; toolResults: Array<AnthropicToolResult> } {
+  const messages: Array<AnthropicMessage> = [];
+  const toolResults: Array<AnthropicToolResult> = [];
+  
+  for (const item of input) {
+    if (item.type === "message") {
+      const message: AnthropicMessage = {
+        role: item.role as "user" | "assistant" | "system",
+        content: [],
+      };
+      
+      for (const contentItem of item.content) {
+        if (contentItem.type === "input_text" || contentItem.type === "output_text") {
+          message.content.push({ type: "text", text: contentItem.text });
+        } else if (contentItem.type === "input_image") {
+          // Convert to base64 if needed
+          message.content.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg", // Assuming JPEG as default
+              data: contentItem.image_url.replace(/^data:image\/[^;]+;base64,/, ""),
+            },
+          });
+        }
+        // Skip other content types not supported by Anthropic
+      }
+      
+      if (message.content.length > 0) {
+        messages.push(message);
+      }
+    } else if (item.type === "function_call_output") {
+      // Convert function outputs to tool results
+      toolResults.push({
+        tool_use_id: item.call_id,
+        output: item.output,
+      });
+    }
+  }
+  
+  return { messages, toolResults };
+}
+
+// Map Anthropic responses back to OpenAI format for Codex
+interface AnthropicResponse {
+  id?: string;
+  content?: Array<{ type: string; text?: string }>;
+  tool_uses?: Array<{ id: string; name: string; input: Record<string, unknown> }>;
+}
+
+function mapAnthropicResponseToOpenAI(
+  anthropicResponse: AnthropicResponse, 
+  conversationId: string
+): Array<ResponseItem> {
+  const responseItems: Array<ResponseItem> = [];
+  
+  // Map the main message content
+  if (anthropicResponse.content) {
+    const messageItem: ResponseItem = {
+      id: `${conversationId}-message`,
+      type: "message",
+      role: "assistant",
+      content: anthropicResponse.content.map((contentBlock) => {
+        if (contentBlock.type === "text") {
+          return {
+            type: "output_text",
+            text: contentBlock.text,
+          };
+        }
+        // Handle other content types as needed
+        return null;
+      }).filter(Boolean),
+    };
+    
+    responseItems.push(messageItem);
+  }
+  
+  // Map tool calls to function_call format
+  if (anthropicResponse.tool_uses) {
+    for (const toolUse of anthropicResponse.tool_uses) {
+      const functionCallItem: ResponseItem = {
+        id: toolUse.id,
+        type: "function_call",
+        name: toolUse.name,
+        call_id: toolUse.id,
+        arguments: JSON.stringify(toolUse.input),
+      };
+      
+      responseItems.push(functionCallItem);
+    }
+  }
+  
+  return responseItems;
+}
+
+/**
+ * Anthropic client implementation
+ */
+class AnthropicClient {
+  private apiKey: string;
+  private baseUrl: string;
+  private defaultModel: string;
+  
+  constructor(apiKey: string, options?: { baseUrl?: string; defaultModel?: string }) {
+    this.apiKey = apiKey;
+    this.baseUrl = options?.baseUrl || "https://api.anthropic.com/v1";
+    this.defaultModel = options?.defaultModel || "claude-3-7-sonnet-20250219";
+  }
+  
+  /**
+   * Main method to send messages to Anthropic Claude
+   */
+  async sendMessage(
+    input: Array<ResponseInputItem>,
+    options?: {
+      model?: string;
+      system?: string;
+      maxTokens?: number;
+      temperature?: number;
+      conversationId?: string;
+      tools?: Array<AnthropicTool>;
+      toolResults?: Array<AnthropicToolResult>;
+    }
+  ): Promise<{ items: Array<ResponseItem>; response_id: string }> {
+    const model = options?.model || this.defaultModel;
+    const conversationId = options?.conversationId || `conv_${Date.now()}`;
+    
+    // Convert input to Anthropic format
+    const { messages, toolResults } = mapOpenAIInputToAnthropic(input);
+    
+    // Call Anthropic API with rate limiting
+    try {
+      // More accurate token estimation (Anthropic-specific)
+      // This is a better approximation for Claude models
+      const estimatedTokens = this.estimateTokenCount(messages, options?.system);
+      
+      const response = await executeWithRateLimiting(
+        'anthropic',
+        async () => {
+          // Prepare request payload
+          interface AnthropicRequestBody {
+            model: string;
+            messages: Array<AnthropicMessage>;
+            max_tokens: number;
+            temperature: number;
+            system?: string;
+            tools?: Array<AnthropicTool>;
+            tool_choice?: string;
+            tool_results?: Array<AnthropicToolResult>;
+          }
+          
+          const requestBody: AnthropicRequestBody = {
+            model,
+            messages,
+            max_tokens: options?.maxTokens || 4096,
+            temperature: options?.temperature || 0.7,
+          };
+          
+          // Add system instruction if provided
+          if (options?.system) {
+            requestBody.system = options.system;
+          }
+          
+          // Add tools if provided
+          if (options?.tools && options.tools.length > 0) {
+            requestBody.tools = options.tools;
+          }
+          
+          // Add tool results if available
+          if (toolResults.length > 0 || (options?.toolResults && options.toolResults.length > 0)) {
+            requestBody.tool_choice = "auto";
+            requestBody.tool_results = [
+              ...(options?.toolResults || []),
+              ...toolResults,
+            ];
+          }
+          
+          if (isLoggingEnabled()) {
+            log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
+          }
+          
+          // Make the API call with better error handling
+          const response = await fetch(`${this.baseUrl}/messages`, {
+            method: "POST",
+            headers: {
+              "x-api-key": this.apiKey,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+              // "anthropic-beta": "tools-2023-12-15", // Removed - no longer supported
+            },
+            body: JSON.stringify(requestBody),
+          });
+          
+          if (!response.ok) {
+            // Get error details
+            const errorText = await response.text();
+            let errorObj: Record<string, any> = {};
+            
+            try {
+              errorObj = JSON.parse(errorText);
+            } catch {
+              // If parsing fails, use the raw error text
+              errorObj = { message: errorText };
+            }
+            
+            // Add status code to error object
+            errorObj.status = response.status;
+            
+            // Check for retry-after header
+            const retryAfter = response.headers.get('retry-after');
+            if (retryAfter) {
+              errorObj.retry_after = retryAfter;
+            }
+            
+            // Copy relevant headers for error analysis
+            errorObj.headers = {};
+            response.headers.forEach((value, key) => {
+              errorObj.headers[key] = value;
+            });
+            
+            // Only apply rate limit special casing when it's actually a rate limit
+            // Don't transform other error types
+            if (response.status === 429 || 
+                (errorObj.error?.type === 'rate_limit_error') ||
+                (errorObj.error?.message && errorObj.error.message.includes('rate limit'))) {
+              errorObj.type = 'rate_limit_error';
+            }
+            
+            // Create a proper error with the detailed message
+            const errorMsg = errorObj.error?.message || errorObj.message || errorText;
+            const error = new Error(`Anthropic API Error (${response.status}): ${errorMsg}`);
+            
+            // Attach the original error details for debugging
+            (error as any).details = errorObj;
+            
+            // Throw the error with its original message and status
+            throw error;
+          }
+          
+          return response.json();
+        },
+        {
+          estimatedTokens,
+          // Configure timeout for Anthropic requests
+          timeoutMs: 60000, // 60 second timeout for Claude
+          onRateLimitEncountered: (delayMs, attempt) => {
+            log(`Anthropic rate limit encountered: waiting ${Math.round(delayMs / 1000)}s before attempt ${attempt}`);
+            
+            // Don't throw here - the rate limiter will handle retrying automatically 
+            // and we'll let the executeWithRateLimiting function manage the retries
+          },
+          onFinalFailure: (error) => {
+            log(`Anthropic API error after all retries: ${JSON.stringify(error)}`);
+            
+            // Special handling for rate limit errors only
+            if (isRateLimitError(error)) {
+              // This will be caught by the agent loop and displayed to the user
+              const errorObj = error as Record<string, any>;
+              const status = errorObj?.status ?? errorObj?.httpStatus ?? errorObj?.statusCode;
+              
+              const errorDetails = [
+                `Status: ${status || "unknown"}`,
+                `Code: ${errorObj.code || "unknown"}`,
+                `Type: ${errorObj.type || "unknown"}`,
+                `Message: ${errorObj.message || "unknown"}`,
+              ].join(", ");
+              
+              throw new Error(`⚠️ Rate limit reached after multiple attempts. Error details: ${errorDetails}. Please try again later.`);
+            } else {
+              // For other errors, show the original error message clearly
+              const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+              throw new Error(`⚠️ Anthropic API Error: ${errorMessage}`);
+            }
+          }
+        }
+      );
+      
+      // Map the response back to OpenAI format
+      const items = mapAnthropicResponseToOpenAI(response, conversationId);
+      
+      return {
+        items,
+        response_id: response.id || conversationId,
+      };
+    } catch (error) {
+      // Log the full error details for debugging
+      log(`Error calling Anthropic API: ${error instanceof Error ? error.message : JSON.stringify(error)}`);
+      
+      // Enhanced error handling for specific error types
+      const errorObj = error as Record<string, any>;
+      const details = errorObj.details || errorObj;
+      
+      // Handle content policy violations in a user-friendly way
+      if (details.type === 'content_policy_violation' || 
+          details.error_type === 'content_policy_violation' || 
+          details.error?.type === 'content_policy_violation' ||
+          (typeof errorObj.message === 'string' && 
+           errorObj.message.includes('content filter'))) {
+        throw new Error(
+          "Anthropic's content filter has blocked this request. " +
+          "Please modify your prompt and try again."
+        );
+      }
+      
+      // Handle API errors with more specific information
+      if (details.status === 400 || details.status === 401 || details.status === 403) {
+        const message = details.error?.message || details.message || "Unknown error";
+        throw new Error(`Anthropic API Error (${details.status}): ${message}`);
+      }
+      
+      // Preserve the original error with its message
+      if (error instanceof Error) {
+        throw error;
+      } else {
+        throw new Error(`Anthropic API Error: ${JSON.stringify(error)}`);
+      }
+    }
+  }
+  
+  /**
+   * Estimate token count for Anthropic models
+   * More accurate than the generic byte-based estimate
+   */
+  private estimateTokenCount(
+    messages: Array<AnthropicMessage>, 
+    systemPrompt?: string
+  ): number {
+    // Constants for Claude token estimation
+    const AVG_CHARS_PER_TOKEN = 4;
+    const MESSAGE_OVERHEAD_TOKENS = 4; // Tokens for message formatting
+    
+    let totalTokens = 0;
+    
+    // Count system prompt tokens
+    if (systemPrompt) {
+      totalTokens += Math.ceil(systemPrompt.length / AVG_CHARS_PER_TOKEN) + 10; // Extra overhead for system
+    }
+    
+    // Count message tokens
+    for (const message of messages) {
+      // Add per-message overhead
+      totalTokens += MESSAGE_OVERHEAD_TOKENS;
+      
+      // Count tokens in content
+      for (const content of message.content) {
+        if (content.type === 'text') {
+          totalTokens += Math.ceil((content.text?.length || 0) / AVG_CHARS_PER_TOKEN);
+        } else if (content.type === 'image') {
+          // Images have higher token counts in Claude
+          // Base64 images are approximately 4/3 their byte size
+          const base64Data = content.source?.data || '';
+          const imageBytes = base64Data.length * 0.75;
+          // Very rough approximation: 85 tokens per 512x512 image 
+          // Adjust based on estimated image complexity
+          totalTokens += Math.max(85, Math.ceil(imageBytes / 5000));
+        }
+      }
+    }
+    
+    return totalTokens;
+  }
+  
+  /**
+   * Configure the tools required for Codex CLI
+   * Conforms to Anthropic's current tool specification
+   */
+  getToolsForCodex(): Array<AnthropicTool> {
+    return [
+      {
+        name: "shell",
+        description: "Runs a shell command, and returns its output.",
+        input_schema: {
+          type: "object",
+          properties: {
+            command: { 
+              type: "string", 
+              description: "The command to execute. Can include arguments."
+            },
+            workdir: {
+              type: "string",
+              description: "The working directory for the command.",
+            },
+            timeout: {
+              type: "number",
+              description: "The maximum time to wait for the command to complete in milliseconds.",
+            },
+          },
+          required: ["command"],
+        },
+      },
+    ];
+  }
+}
+
+/**
+ * Factory function to create an Anthropic client instance
+ */
+export function createAnthropicClient(
+  apiKey: string,
+  options?: { baseUrl?: string; defaultModel?: string }
+): AnthropicClient {
+  return new AnthropicClient(apiKey, options);
+}
+
+/**
+ * Implementation for Anthropic provider that meets the ModelProviderInterface
+ */
+class AnthropicProvider implements ModelProviderInterface {
+  public provider = ModelProvider.ANTHROPIC;
+  private client: any;
+  private model: string;
+  private options: ProviderOptions;
+  
+  constructor(options: ProviderOptions) {
+    this.model = options.model;
+    this.options = options;
+    // Client will be initialized lazily in sendMessage
+  }
+  
+  private async initializeClient(): Promise<void> {
+    if (this.client) return;
+    
+    this.client = createAnthropicClient(this.options.apiKey, {
+      baseUrl: this.options.baseUrl,
+      defaultModel: this.options.model,
+    });
+  }
+  
+  async sendMessage(
+    input: Array<ResponseInputItem>,
+    options: {
+      reasoning?: unknown;
+      system?: string;
+      temperature?: number;
+      previousResponseId?: string;
+      conversationId?: string;
+    }
+  ): Promise<{
+    items: Array<ResponseItem>;
+    response_id: string;
+  }> {
+    try {
+      // Make sure client is initialized
+      await this.initializeClient();
+      
+      return this.client.sendMessage(input, {
+        model: this.model,
+        system: options.system,
+        temperature: options.temperature,
+        conversationId: options.conversationId,
+        tools: this.client.getToolsForCodex(),
+      });
+    } catch (error) {
+      if (isLoggingEnabled()) {
+        log(`Error in Anthropic provider: ${error}`);
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * Factory function for creating Anthropic provider instances
+ */
+export async function createAnthropicProvider(options: ProviderOptions): Promise<ModelProviderInterface> {
+  return new AnthropicProvider(options);
+}
+
+// Register this provider with the registry
+providerRegistry.registerProvider(
+  ModelProvider.ANTHROPIC,
+  createAnthropicProvider,
+  [/^claude/, /anthropic/] // Model name patterns for Anthropic
+);
