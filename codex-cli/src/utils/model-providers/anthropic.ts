@@ -256,19 +256,21 @@ class AnthropicClient {
           // Add system instruction if provided
           if (options?.system) {
             // Enhance system prompt for Claude to encourage tool usage
+            // Keep it similar to what OpenAI would receive, just with guidance on using tools
             const toolUsageInstructions = `
-IMPORTANT: You MUST use the shell tool to explore files, run commands, and interact with the filesystem.
-When asked to look at code, search for files, or perform any operations:
-1. ALWAYS use the shell tool
-2. NEVER say you'll do something without actually doing it
-3. MAINTAIN context between messages
-4. EXECUTE commands before responding substantively
+IMPORTANT: You have access to a shell tool. Use it when needed to:
+- List directories and explore files (ls)
+- Search for code or files (grep, find)
+- Run commands to accomplish tasks
+- Execute code or tests
+
+First use the shell tool to gather information before responding substantively.
 `;
             requestBody.system = `${options.system}\n\n${toolUsageInstructions}`;
           }
           
-          // IMPORTANT: Always include the shell tool for Claude models
-          // This ensures tool calls are properly handled
+          // IMPORTANT: Define tools to match OpenAI's implementation exactly
+          // With Anthropic-specific format but identical functionality
           requestBody.tools = [
             {
               name: "shell",
@@ -276,9 +278,11 @@ When asked to look at code, search for files, or perform any operations:
               input_schema: {
                 type: "object",
                 properties: {
-                  command: { 
+                  command: {
+                    // OpenAI uses array format, but we need to document it differently for Anthropic
+                    // The mapping function will convert string to array format when needed
                     type: "string", 
-                    description: "The command to execute. Can include arguments."
+                    description: "The command to execute as a string. Will be split into command and arguments."
                   },
                   workdir: {
                     type: "string",
@@ -294,8 +298,8 @@ When asked to look at code, search for files, or perform any operations:
             }
           ];
           
-          // Set tool_choice as object per Anthropic API requirements
-          // Use "auto" to match OpenAI's approach - the model decides when to use tools
+          // Set tool_choice to match OpenAI's expected behavior
+          // For Anthropic, we need to explicitly set this as an object
           requestBody.tool_choice = { type: "auto" };
           
           // Add tool results if available
@@ -495,7 +499,8 @@ When asked to look at code, search for files, or perform any operations:
   
   /**
    * Configure the tools required for Codex CLI
-   * Conforms to Anthropic's current tool specification
+   * Conforms to Anthropic's current tool specification while maintaining
+   * compatibility with OpenAI's format
    */
   getToolsForCodex(): Array<AnthropicTool> {
     return [
@@ -505,9 +510,11 @@ When asked to look at code, search for files, or perform any operations:
         input_schema: {
           type: "object",
           properties: {
-            command: { 
+            command: {
+              // OpenAI uses array format, but we need to document it differently for Anthropic
+              // The mapping function will convert string to array format when needed
               type: "string", 
-              description: "The command to execute. Can include arguments."
+              description: "The command to execute as a string. Will be split into command and arguments."
             },
             workdir: {
               type: "string",
