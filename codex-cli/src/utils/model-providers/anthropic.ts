@@ -502,10 +502,13 @@ First use the shell tool to gather information before responding substantively.
                       } else if (data.type === "message_stop") {
                         // Send final complete message
                         if (fullTextContent) {
+                          // Create a unique message ID that includes response ID for tracking
+                          const finalMessageId = messageId || `${responseId}-message-${Date.now()}`;
+                          
                           yield {
                             type: "response.output_item.done",
                             item: {
-                              id: messageId || `message-${Date.now()}`,
+                              id: finalMessageId,
                               type: "message",
                               role: "assistant",
                               content: [{ 
@@ -514,18 +517,27 @@ First use the shell tool to gather information before responding substantively.
                               }],
                             }
                           };
+                          
+                          if (isLoggingEnabled()) {
+                            log(`Yielded final message with ID: ${finalMessageId}, content length: ${fullTextContent.length}`);
+                          }
                         }
                         
-                        // End of message
+                        // End of message - THIS IS CRITICAL
+                        // The response.id MUST be passed back to maintain conversation context
                         yield {
                           type: "response.completed",
                           response: {
-                            id: responseId,
+                            id: responseId, // This gets stored as lastResponseId in agent-loop
                             status: "completed",
-                            // Empty output since we already yielded the individual items
+                            // Empty output since we've already yielded the individual items
                             output: []
                           }
                         };
+                        
+                        if (isLoggingEnabled()) {
+                          log(`Yielded completed response with ID: ${responseId}`);
+                        }
                       }
                     } catch (e) {
                       if (isLoggingEnabled()) {
@@ -754,17 +766,21 @@ class AnthropicProvider implements ModelProviderInterface {
       }
       
       // Handle conversation context properly - this is critical for maintaining context
-      let conversationId = options.conversationId || `conv_${Date.now()}`;
+      // For Anthropic's Messages API, the conversationId is a client-side concept
+      // that we use to organize messages from the same conversation
+      let conversationId = options.conversationId || this.sessionId || `conv_${Date.now()}`;
       
-      // If we have a previous response ID from the same conversation, use that
-      if (options.previousResponseId) {
-        conversationId = options.previousResponseId;
-      }
+      // Store the previous response ID to include the turn context
+      // This is CRITICAL for maintaining conversation context in the Messages API
+      const previousResponseId = options.previousResponseId;
       
       if (isLoggingEnabled()) {
         log(`Using conversation ID: ${conversationId}`);
-        log(`Previous response ID: ${options.previousResponseId || "none"}`);
-        log(`Explicit conversation ID: ${options.conversationId || "none"}`);
+        log(`Previous response ID: ${previousResponseId || "none"}`);
+        log(`Input message count: ${input.length}`);
+        for (let i = 0; i < input.length; i++) {
+          log(`Input ${i}: ${input[i].type} - ${input[i].role || "unknown role"}`);
+        }
       }
       
       // Only streaming (matching OpenAI behavior)
