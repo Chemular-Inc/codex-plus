@@ -53,6 +53,29 @@ vi.mock("../src/utils/agent/log.js", () => ({
   isLoggingEnabled: () => false,
 }));
 
+// Mock provider interface
+vi.mock("../src/utils/model-providers/index.js", () => ({
+  __esModule: true,
+  ModelProvider: {
+    OPENAI: "openai",
+    ANTHROPIC: "anthropic",
+  },
+  detectProviderFromModel: () => "openai",
+  providerRegistry: {
+    createProviderFromConfig: vi.fn().mockResolvedValue(null),
+  },
+}));
+
+// Mock rate limiter
+vi.mock("../src/utils/rate-limiter.js", () => ({
+  __esModule: true,
+  executeWithRateLimiting: async (provider, fn) => fn(),
+  globalRateLimiter: { 
+    trackSuccessfulRequest: vi.fn(),
+    shouldThrottle: () => ({ throttle: false, recommendedDelay: 0 }),
+  },
+}));
+
 import { AgentLoop } from "../src/utils/agent/agent-loop.js";
 
 describe("AgentLoop – rate‑limit handling", () => {
