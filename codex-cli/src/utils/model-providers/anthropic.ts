@@ -564,14 +564,8 @@ First use the shell tool to gather information before responding substantively.
           }
         }
       );
-      
-      // Map the response back to OpenAI format
-      const items = mapAnthropicResponseToOpenAI(response, conversationId);
-      
-      return {
-        items,
-        response_id: response.id || conversationId,
-      };
+      // Return the stream directly as an async iterable
+      return response;
     } catch (error) {
       // Log the full error details for debugging
       log(`Error calling Anthropic API: ${error instanceof Error ? error.message : JSON.stringify(error)}`);
