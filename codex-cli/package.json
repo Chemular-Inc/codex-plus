@@ -1,5 +1,5 @@
 {
-  "name": "@chemular/codex-plus",
+  "name": "codex-plus-cli",
   "version": "0.1.0-beta.1",
   "license": "Apache-2.0",
   "bin": {
