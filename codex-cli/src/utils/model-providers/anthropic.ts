@@ -32,93 +32,120 @@ interface AnthropicToolResult {
 }
 
 // Mapping function between OpenAI and Anthropic formats
+/**
+ * Map OpenAI format messages to Anthropic format
+ * This is a critical component - we must ensure Anthropic gets the full conversation context
+ * Anthropic needs to see the complete back-and-forth to maintain context
+ */
 function mapOpenAIInputToAnthropic(
   input: Array<ResponseInputItem>
 ): { messages: Array<AnthropicMessage>; toolResults: Array<AnthropicToolResult> } {
+  // Store messages in order they appear
   const messages: Array<AnthropicMessage> = [];
+  // Store all tool results to pass to Anthropic
   const toolResults: Array<AnthropicToolResult> = [];
   
+  // Message ordering is critical for context
+  let messageCounter = 0;
+  
+  // Debug to see what we're working with
   if (isLoggingEnabled()) {
-    log(`Converting ${input.length} messages to Anthropic format`);
+    log(`========== CONVERSATION MAPPING ==========`);
+    log(`Converting ${input.length} items to Anthropic format`);
+    log(`Input item types: ${input.map(i => i.type).join(', ')}`);
   }
   
-  // First pass - collect all messages, including the last assistant message
-  // This is critical since we need the entire conversation history
+  // First process all items to capture the complete conversation
   for (const item of input) {
+    // Process message items (user and assistant messages)
     if (item.type === "message") {
+      messageCounter++;
+      
+      // Detailed logging
+      if (isLoggingEnabled()) {
+        log(`Message #${messageCounter} - role: ${item.role}, content items: ${item.content?.length || 0}`);
+        if (item.content && item.content.length > 0) {
+          const previewText = item.content[0]?.text?.substring(0, 30) || ""; 
+          log(`  Preview: "${previewText}..."`);
+        }
+      }
+      
+      // Create Anthropic message object
       const message: AnthropicMessage = {
         role: item.role as "user" | "assistant" | "system",
         content: [],
       };
       
-      // Log message details for debugging
-      if (isLoggingEnabled()) {
-        log(`Processing message - role: ${item.role}, content items: ${item.content.length}`);
-      }
-      
-      // Safely process each content item
-      for (const contentItem of item.content) {
-        if (contentItem.type === "input_text" || contentItem.type === "output_text") {
-          message.content.push({ 
-            type: "text", 
-            text: contentItem.text 
-          });
-          
-          if (isLoggingEnabled()) {
-            // Log truncated content for debugging
-            const previewText = contentItem.text.length > 50 
-              ? contentItem.text.substring(0, 50) + "..." 
-              : contentItem.text;
-            log(`Added text content: "${previewText}"`);
-          }
-        } else if (contentItem.type === "input_image" && "image_url" in contentItem) {
-          // Convert to base64 if needed
-          message.content.push({
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: "image/jpeg", // Assuming JPEG as default
-              data: contentItem.image_url.replace(/^data:image\/[^;]+;base64,/, ""),
-            },
-          });
-          
-          if (isLoggingEnabled()) {
-            log(`Added image content`);
+      // Process all content in this message
+      if (item.content && item.content.length > 0) {
+        for (const contentItem of item.content) {
+          // Handle text content (most common)
+          if ((contentItem.type === "input_text" || contentItem.type === "output_text") && contentItem.text) {
+            message.content.push({ 
+              type: "text", 
+              text: contentItem.text 
+            });
+          } 
+          // Handle image content
+          else if (contentItem.type === "input_image" && "image_url" in contentItem) {
+            message.content.push({
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg", 
+                data: contentItem.image_url.replace(/^data:image\/[^;]+;base64,/, ""),
+              },
+            });
           }
         }
-        // Skip other content types not supported by Anthropic
       }
       
+      // Only add messages that have content
       if (message.content.length > 0) {
         messages.push(message);
-        
-        if (isLoggingEnabled()) {
-          log(`Added message with role: ${message.role}, content items: ${message.content.length}`);
-        }
       }
-    } else if (item.type === "function_call_output" && "call_id" in item) {
-      // Convert function outputs to tool results
+    } 
+    // Process function call outputs (tool results)
+    else if (item.type === "function_call_output" && "call_id" in item) {
       toolResults.push({
         tool_use_id: item.call_id,
         output: item.output,
       });
       
       if (isLoggingEnabled()) {
-        log(`Added tool result for call_id: ${item.call_id}`);
+        log(`Tool result for call_id: ${item.call_id}`);
       }
     }
   }
   
+  // Print detailed conversation flow for debugging
   if (isLoggingEnabled()) {
-    log(`Mapped to ${messages.length} messages and ${toolResults.length} tool results`);
+    log(`\nFinal conversation structure: ${messages.length} messages`);
+    log(`Conversation flow:`);
     
-    // Show the conversation flow for debugging
-    let conversationPreview = "Conversation flow: ";
-    for (const msg of messages) {
-      conversationPreview += `[${msg.role}] → `;
+    messages.forEach((msg, idx) => {
+      const contentPreview = msg.content[0]?.text?.substring(0, 20) || "";
+      log(`  ${idx+1}. [${msg.role}] -> "${contentPreview}..."`);
+    });
+    
+    log(`Tool results: ${toolResults.length}`);
+    log(`========== END MAPPING ==========\n`);
+  }
+  
+  // Messages array must have at least one entry for the current user message
+  if (messages.length === 0) {
+    if (isLoggingEnabled()) {
+      log(`WARNING: No valid messages found in input! Adding placeholder.`);
     }
-    conversationPreview += "[end]";
-    log(conversationPreview);
+    
+    // Add a placeholder message if somehow we didn't get any
+    messages.push({
+      role: "user",
+      content: [{
+        type: "text",
+        text: "Hello"
+      }]
+    });
   }
   
   return { messages, toolResults };
@@ -833,12 +860,25 @@ class AnthropicProvider implements ModelProviderInterface {
         }
       }
       
-      // Only streaming (matching OpenAI behavior)
-      return await this.client.sendMessage(input, {
+      if (isLoggingEnabled()) {
+        log(`============= SENDING REQUEST =============`);
+        log(`Model: ${this.model}`);
+        log(`Conversation ID: ${conversationId}`);
+        log(`Previous Response ID: ${previousResponseId || "none"}`);
+        log(`System prompt length: ${(options.system || "").length} chars`);
+        log(`Thinking config: ${JSON.stringify(options.thinking || {})}`);
+        log(`Temperature: ${options.temperature || 0.7}`);
+      }
+      
+      // Call Anthropic client with streaming enabled
+      const response = await this.client.sendMessage(input, {
         model: this.model,
         system: options.system,
-        temperature: options.temperature || 0.7,
+        // Force temperature to 1.0 for thinking-enabled models
+        temperature: options.thinking ? 1.0 : (options.temperature || 0.7),
+        // This is critical - pass the conversation context
         conversationId,
+        previousResponseId,
         // Always include shell tool to match OpenAI capability
         tools: this.client.getToolsForCodex(),
         // Pass thinking configuration if provided
@@ -846,6 +886,13 @@ class AnthropicProvider implements ModelProviderInterface {
         // Always stream - this matches the OpenAI behavior
         stream: true
       });
+      
+      if (isLoggingEnabled()) {
+        log(`Request sent to Anthropic API`);
+        log(`============= END REQUEST =============\n`);
+      }
+      
+      return response;
     } catch (error) {
       if (isLoggingEnabled()) {
         log(`Error in Anthropic provider: ${error instanceof Error ? error.message : String(error)}`);
