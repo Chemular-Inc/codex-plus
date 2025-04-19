@@ -5,11 +5,21 @@ import { detectProviderFromModel, ModelProvider } from "./model-providers/index.
 const MODEL_LIST_TIMEOUT_MS = 2_000; // 2 seconds
 export const RECOMMENDED_MODELS: Array<string> = ["o4-mini", "o3"];
 export const SUPPORTED_CLAUDE_MODELS: Array<string> = [
+  // Full model identifiers with version numbers
   "claude-3-opus-20240229",
   "claude-3-sonnet-20240229", 
   "claude-3-haiku-20240307",
   "claude-3-7-sonnet-20250219",
-  "claude-3.5-sonnet-20240620",
+  "claude-3-5-sonnet-20240620",
+  
+  // Abbreviated model names with hyphens (preferred format for API)
+  "claude-3-opus",
+  "claude-3-sonnet",
+  "claude-3-haiku",
+  "claude-3-7-sonnet",
+  "claude-3-5-sonnet",
+  
+  // Dot notation variants (for user convenience)
   "claude-3",
   "claude-3.5",
   "claude-3.7"
@@ -64,6 +74,18 @@ export async function getAvailableModels(): Promise<Array<string>> {
 }
 
 /**
+ * Map user-friendly model names to API-compatible model names
+ */
+export function normalizeModelName(model: string): string {
+  // For Claude models, convert dot notation (claude-3.7) to hyphen notation (claude-3-7)
+  if (model.toLowerCase().includes("claude")) {
+    // Replace dots with hyphens in version numbers
+    return model.replace(/(\d+)\.(\d+)/g, "$1-$2");
+  }
+  return model;
+}
+
+/**
  * Verify that the provided model identifier is present in the set returned by
  * {@link getAvailableModels} or is a supported Claude model.
  * The list of models is fetched from the OpenAI `/models` endpoint the first time 
@@ -83,8 +105,11 @@ export async function isModelSupportedForResponses(
   // Check if this is a Claude model
   const provider = detectProviderFromModel(model);
   if (provider === ModelProvider.ANTHROPIC) {
+    // Try the normalized model name
+    const normalizedModel = normalizeModelName(model);
+    
     // Either it's in our supported list or we'll trust it if it has "claude" in the name
-    return SUPPORTED_CLAUDE_MODELS.includes(model) || 
+    return SUPPORTED_CLAUDE_MODELS.includes(normalizedModel) || 
            model.toLowerCase().includes("claude");
   }
 

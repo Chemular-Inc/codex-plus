@@ -8,6 +8,7 @@ import { log, isLoggingEnabled } from "../agent/log.js";
 import { executeWithRateLimiting } from "../rate-limiter.js";
 import { isRateLimitError } from "../error-types.js";
 import { ModelProvider, ProviderOptions, ModelProviderInterface, providerRegistry } from "./provider-interface.js";
+import { normalizeModelName } from "../model-utils.js";
 
 // Types mirroring Anthropic API structures
 type AnthropicMessage = {
@@ -146,7 +147,9 @@ class AnthropicClient {
   constructor(apiKey: string, options?: { baseUrl?: string; defaultModel?: string }) {
     this.apiKey = apiKey;
     this.baseUrl = options?.baseUrl || "https://api.anthropic.com/v1";
-    this.defaultModel = options?.defaultModel || "claude-3-7-sonnet-20250219";
+    // Use normalized model name and a more reliable default model
+    const defaultModel = options?.defaultModel || "claude-3-sonnet";
+    this.defaultModel = normalizeModelName(defaultModel);
   }
   
   /**
@@ -164,7 +167,9 @@ class AnthropicClient {
       toolResults?: Array<AnthropicToolResult>;
     }
   ): Promise<{ items: Array<ResponseItem>; response_id: string }> {
-    const model = options?.model || this.defaultModel;
+    // Use normalized model name to ensure compatibility with Anthropic API
+    const rawModel = options?.model || this.defaultModel;
+    const model = normalizeModelName(rawModel);
     const conversationId = options?.conversationId || `conv_${Date.now()}`;
     
     // Convert input to Anthropic format

@@ -27,6 +27,7 @@ import { createInputItem } from "./utils/input-utils";
 import {
   isModelSupportedForResponses,
   preloadModels,
+  normalizeModelName,
 } from "./utils/model-utils.js";
 import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
@@ -252,7 +253,9 @@ let config = loadConfig(undefined, undefined, {
 });
 
 const prompt = cli.input[0];
-const model = cli.flags.model;
+const rawModel = cli.flags.model as string | undefined;
+// Normalize the model name if provided, especially for Claude models
+const model = rawModel ? normalizeModelName(rawModel) : undefined;
 const imagePaths = cli.flags.image as Array<string> | undefined;
 
 config = {
