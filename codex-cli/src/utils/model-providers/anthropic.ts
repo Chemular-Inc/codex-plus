@@ -419,6 +419,8 @@ First use the shell tool to gather information before responding substantively.
               const decoder = new TextDecoder();
               let buffer = "";
               let responseId = "";
+              let messageId = "";
+              let fullTextContent = ""; // Accumulate all text chunks
               
               // Handle abort signal
               controller.signal.addEventListener('abort', () => {
@@ -452,37 +454,36 @@ First use the shell tool to gather information before responding substantively.
                       if (data.type === "message_start") {
                         responseId = data.message.id;
                         // Generate unique message ID based on the response ID
-                        const messageId = `${responseId}-message`;
+                        messageId = `${responseId}-message`;
                         
                         // Some models send initial content in the message_start event
                         if (data.message?.content && data.message.content.length > 0) {
                           for (const content of data.message.content) {
                             if (content.type === "text" && content.text) {
-                              yield {
-                                type: "response.output_item.done",
-                                item: {
-                                  id: messageId,
-                                  type: "message",
-                                  role: "assistant",
-                                  content: [{ type: "output_text", text: content.text }],
-                                }
-                              };
+                              fullTextContent += content.text;
                             }
                           }
                         }
                       } else if (data.type === "content_block_start" || data.type === "content_block_delta") {
-                        // Handle message content blocks
+                        // Accumulate content deltas instead of yielding each one
                         const textContent = data.content_block?.text || data.delta?.text;
                         if (textContent) {
-                          // Generate a stable ID for content items
-                          const contentId = data.content_block?.id || `${responseId}-content-${Date.now()}`;
+                          fullTextContent += textContent;
+                          
+                          // Format compatible with OpenAI streaming
                           yield {
-                            type: "response.output_item.done",
+                            type: "response.output_item.delta",
+                            delta: { 
+                              text: textContent 
+                            },
                             item: {
-                              id: contentId,
+                              id: messageId || `message-${Date.now()}`,
                               type: "message",
                               role: "assistant",
-                              content: [{ type: "output_text", text: textContent }],
+                              content: [{ 
+                                type: "output_text", 
+                                text: fullTextContent 
+                              }],
                             }
                           };
                         }
@@ -499,6 +500,22 @@ First use the shell tool to gather information before responding substantively.
                           }
                         };
                       } else if (data.type === "message_stop") {
+                        // Send final complete message
+                        if (fullTextContent) {
+                          yield {
+                            type: "response.output_item.done",
+                            item: {
+                              id: messageId || `message-${Date.now()}`,
+                              type: "message",
+                              role: "assistant",
+                              content: [{ 
+                                type: "output_text", 
+                                text: fullTextContent 
+                              }],
+                            }
+                          };
+                        }
+                        
                         // End of message
                         yield {
                           type: "response.completed",
