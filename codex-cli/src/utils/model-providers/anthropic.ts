@@ -246,25 +246,36 @@ class AnthropicClient {
   private baseUrl: string;
   private defaultModel: string;
   
-  constructor(apiKey: string, options?: { baseUrl?: string; defaultModel?: string }) {
+  // Reference to the provider that created this client for callback purposes
+  _provider: any = null;
+  
+  constructor(apiKey: string, options?: { baseUrl?: string; defaultModel?: string; provider?: any }) {
     this.apiKey = apiKey;
     this.baseUrl = options?.baseUrl || "https://api.anthropic.com/v1";
     // Use normalized model name and a more reliable default model
     const defaultModel = options?.defaultModel || "claude-3-sonnet";
     this.defaultModel = normalizeModelName(defaultModel);
+    
+    // Store provider reference for callback purposes
+    if (options?.provider) {
+      this._provider = options.provider;
+    }
   }
   
   /**
    * Main method to send messages to Anthropic Claude
+   * This version can accept either ResponseInputItem[] (OpenAI format)
+   * or AnthropicMessage[] (Anthropic format) for more flexibility
    */
   async sendMessage(
-    input: Array<ResponseInputItem>,
+    input: Array<ResponseInputItem> | Array<AnthropicMessage>,
     options?: {
       model?: string;
       system?: string;
       maxTokens?: number;
       temperature?: number;
       conversationId?: string;
+      previousResponseId?: string;
       tools?: Array<AnthropicTool>;
       toolResults?: Array<AnthropicToolResult>;
       thinking?: { budgetTokens: number };
@@ -275,9 +286,35 @@ class AnthropicClient {
     const rawModel = options?.model || this.defaultModel;
     const model = normalizeModelName(rawModel);
     const conversationId = options?.conversationId || `conv_${Date.now()}`;
+    const previousResponseId = options?.previousResponseId;
     
-    // Convert input to Anthropic format
-    const { messages, toolResults } = mapOpenAIInputToAnthropic(input);
+    let messages: Array<AnthropicMessage>;
+    let toolResults: Array<AnthropicToolResult> = options?.toolResults || [];
+    
+    // Handle both input formats:
+    // 1. If input is already in Anthropic format (Array<AnthropicMessage>), use it directly
+    // 2. If input is in OpenAI format (Array<ResponseInputItem>), convert it
+    if (input.length > 0 && 'role' in input[0] && 'content' in input[0]) {
+      // Input is already in Anthropic format
+      messages = input as Array<AnthropicMessage>;
+      
+      if (isLoggingEnabled()) {
+        log(`Using pre-converted Anthropic messages (${messages.length})`);
+      }
+    } else {
+      // Convert input from OpenAI format to Anthropic format
+      const converted = mapOpenAIInputToAnthropic(input as Array<ResponseInputItem>);
+      messages = converted.messages;
+      
+      // Merge with any tool results passed in options
+      if (converted.toolResults && converted.toolResults.length > 0) {
+        toolResults = [...toolResults, ...converted.toolResults];
+      }
+      
+      if (isLoggingEnabled()) {
+        log(`Converted OpenAI format to ${messages.length} Anthropic messages`);
+      }
+    }
     
     // Call Anthropic API with rate limiting
     try {
@@ -593,6 +630,34 @@ First use the shell tool to gather information before responding substantively.
                           log(`Message complete with ID: ${responseId}, content length: ${fullTextContent.length}`);
                         }
                         
+                        // Create the final message that will be used in the OpenAI format
+                        const finalMessage = {
+                          id: stableMessageId,
+                          type: "message",
+                          role: "assistant",
+                          content: [{
+                            type: "output_text",
+                            text: fullTextContent
+                          }]
+                        };
+                        
+                        // This is the key change: We need to capture the assistant's response
+                        // so we can maintain it in our conversation history
+                        // Get a reference to the AnthropicClient instance
+                        const provider = (stream as any)._provider;
+                        
+                        // If the provider has a captureAssistantResponse method, call it
+                        if (provider && typeof provider.captureAssistantResponse === 'function') {
+                          provider.captureAssistantResponse({
+                            role: "assistant",
+                            content: [{ type: "text", text: fullTextContent }]
+                          });
+                          
+                          if (isLoggingEnabled()) {
+                            log(`Captured assistant response in conversation history`);
+                          }
+                        }
+                        
                         // We need to match EXACTLY how OpenAI formats completion events
                         // The agent-loop.ts expects this exact format to update lastResponseId
                         yield {
@@ -600,15 +665,7 @@ First use the shell tool to gather information before responding substantively.
                           response: {
                             id: responseId, // CRITICAL: This is stored as lastResponseId in agent-loop
                             status: "completed",
-                            output: [{
-                              id: stableMessageId,
-                              type: "message",
-                              role: "assistant",
-                              content: [{
-                                type: "output_text",
-                                text: fullTextContent
-                              }]
-                            }]
+                            output: [finalMessage]
                           }
                         };
                         
@@ -630,6 +687,11 @@ First use the shell tool to gather information before responding substantively.
             
           // Add controller to stream for abort support
           (stream as any).controller = controller;
+          
+          // Add a reference to the provider for capturing the response
+          if (this._provider) {
+            (stream as any)._provider = this._provider;
+          }
           
           return stream;
         },
@@ -790,7 +852,7 @@ First use the shell tool to gather information before responding substantively.
  */
 export function createAnthropicClient(
   apiKey: string,
-  options?: { baseUrl?: string; defaultModel?: string }
+  options?: { baseUrl?: string; defaultModel?: string; provider?: any }
 ): AnthropicClient {
   return new AnthropicClient(apiKey, options);
 }
@@ -798,15 +860,28 @@ export function createAnthropicClient(
 /**
  * Implementation for Anthropic provider that meets the ModelProviderInterface
  */
+/**
+ * Stateful provider for the Anthropic API that maintains conversation history
+ * This is a more complex implementation than the OpenAI provider, because:
+ * 1. We need to maintain conversation history ourselves
+ * 2. We need to map between OpenAI and Anthropic formats
+ * 3. We need to handle the streaming responses correctly
+ */
 class AnthropicProvider implements ModelProviderInterface {
   public provider = ModelProvider.ANTHROPIC;
   private client: any;
   private model: string;
   private options: ProviderOptions;
   
+  // CRITICAL: We maintain our own conversation history as a workaround for Claude's context issues
+  private conversationHistory: Array<AnthropicMessage> = [];
+  private sessionId: string;
+  private lastResponseId: string = "";
+  
   constructor(options: ProviderOptions) {
     this.model = options.model;
     this.options = options;
+    this.sessionId = `session_${Date.now()}`;
     // Client will be initialized lazily in sendMessage
   }
   
@@ -816,9 +891,45 @@ class AnthropicProvider implements ModelProviderInterface {
     this.client = createAnthropicClient(this.options.apiKey, {
       baseUrl: this.options.baseUrl,
       defaultModel: this.options.model,
+      provider: this, // Pass a reference to this provider for callbacks
     });
   }
   
+  // Method to capture assistant responses for conversation history
+  captureAssistantResponse(message: AnthropicMessage): void {
+    // Add the assistant's response to our conversation history
+    this.conversationHistory.push(message);
+    
+    // Update our internal state
+    if (this.lastResponseId) {
+      if (isLoggingEnabled()) {
+        const preview = message.content[0]?.text?.substring(0, 25) || "";
+        log(`Added assistant response to history: "${preview}..."`);
+        log(`Updated conversation history to ${this.conversationHistory.length} messages`);
+      }
+    }
+  }
+  
+  // Helper to print out current conversation state for debugging
+  private debugConversationState(): void {
+    if (!isLoggingEnabled()) return;
+    
+    log("\n======== CONVERSATION STATE ========");
+    log(`Session ID: ${this.sessionId}`);
+    log(`Last Response ID: ${this.lastResponseId}`);
+    log(`History length: ${this.conversationHistory.length} messages`);
+    
+    if (this.conversationHistory.length > 0) {
+      log("Conversation flow:");
+      this.conversationHistory.forEach((msg, idx) => {
+        const preview = msg.content[0]?.text?.substring(0, 25) || "";
+        log(`  ${idx+1}. [${msg.role}] "${preview}..."`);
+      });
+    }
+    log("====================================\n");
+  }
+  
+  // Main method to send a message to Anthropic API
   async sendMessage(
     input: Array<ResponseInputItem>,
     options: {
@@ -834,63 +945,95 @@ class AnthropicProvider implements ModelProviderInterface {
       // Make sure client is initialized
       await this.initializeClient();
       
-      if (isLoggingEnabled()) {
-        log(`Anthropic provider sending message with model: ${this.model}`);
-        log(`Input contains ${input.length} items`);
-        if (options.system) {
-          log(`System prompt length: ${options.system.length}`);
-        }
+      // Maintain internal state for conversation tracking
+      if (options.conversationId) {
+        this.sessionId = options.conversationId;
       }
       
-      // Handle conversation context properly - this is critical for maintaining context
-      // For Anthropic's Messages API, the conversationId is a client-side concept
-      // that we use to organize messages from the same conversation
-      let conversationId = options.conversationId || this.sessionId || `conv_${Date.now()}`;
-      
-      // Store the previous response ID to include the turn context
-      // This is CRITICAL for maintaining conversation context in the Messages API
-      const previousResponseId = options.previousResponseId;
-      
-      if (isLoggingEnabled()) {
-        log(`Using conversation ID: ${conversationId}`);
-        log(`Previous response ID: ${previousResponseId || "none"}`);
-        log(`Input message count: ${input.length}`);
-        for (let i = 0; i < input.length; i++) {
-          log(`Input ${i}: ${input[i].type} - ${input[i].role || "unknown role"}`);
-        }
+      if (options.previousResponseId) {
+        this.lastResponseId = options.previousResponseId;
       }
       
       if (isLoggingEnabled()) {
-        log(`============= SENDING REQUEST =============`);
+        log(`\n============= NEW REQUEST =============`);
         log(`Model: ${this.model}`);
-        log(`Conversation ID: ${conversationId}`);
-        log(`Previous Response ID: ${previousResponseId || "none"}`);
-        log(`System prompt length: ${(options.system || "").length} chars`);
-        log(`Thinking config: ${JSON.stringify(options.thinking || {})}`);
-        log(`Temperature: ${options.temperature || 0.7}`);
+        log(`Input size: ${input.length} items`);
+        log(`System prompt: ${options.system ? `${options.system.length} chars` : "none"}`);
+        this.debugConversationState();
       }
       
-      // Call Anthropic client with streaming enabled
-      const response = await this.client.sendMessage(input, {
-        model: this.model,
-        system: options.system,
-        // Force temperature to 1.0 for thinking-enabled models
-        temperature: options.thinking ? 1.0 : (options.temperature || 0.7),
-        // This is critical - pass the conversation context
-        conversationId,
-        previousResponseId,
-        // Always include shell tool to match OpenAI capability
-        tools: this.client.getToolsForCodex(),
-        // Pass thinking configuration if provided
-        thinking: options.thinking,
-        // Always stream - this matches the OpenAI behavior
-        stream: true
-      });
+      // Process new input and add to conversation
+      const { messages, toolResults } = mapOpenAIInputToAnthropic(input);
+      
+      // Add new user messages to our history
+      // Only keep the most recent messages to avoid hitting context limits
+      const MAX_HISTORY = 20;
+      
+      // Add all new messages to history
+      for (const msg of messages) {
+        // Skip system messages - we'll use the latest system prompt
+        if (msg.role === 'system') continue;
+        
+        // Add user and assistant messages to history
+        this.conversationHistory.push(msg);
+        
+        if (isLoggingEnabled()) {
+          const preview = msg.content[0]?.text?.substring(0, 25) || "";
+          log(`Added to history: [${msg.role}] "${preview}..."`);
+        }
+      }
+      
+      // Trim history if it gets too long (keep most recent messages)
+      if (this.conversationHistory.length > MAX_HISTORY) {
+        const excessMessages = this.conversationHistory.length - MAX_HISTORY;
+        this.conversationHistory = this.conversationHistory.slice(excessMessages);
+        
+        if (isLoggingEnabled()) {
+          log(`Trimmed ${excessMessages} old messages from history`);
+        }
+      }
+      
+      // Now prepare the actual request with our maintained history
+      if (isLoggingEnabled()) {
+        log(`\nPreparing API request with ${this.conversationHistory.length} history messages`);
+        this.debugConversationState();
+      }
+      
+      // Force temperature to 1.0 for thinking-enabled models (Claude requirement)
+      const temperature = options.thinking ? 1.0 : (options.temperature || 0.7);
       
       if (isLoggingEnabled()) {
-        log(`Request sent to Anthropic API`);
-        log(`============= END REQUEST =============\n`);
+        log(`Sending request to Anthropic API`);
+        log(`- Model: ${this.model}`);
+        log(`- Temperature: ${temperature}`);
+        log(`- System prompt: ${options.system ? "yes" : "no"}`);
+        log(`- Thinking: ${options.thinking ? "enabled" : "disabled"}`);
+        log(`- History messages: ${this.conversationHistory.length}`);
+        log(`- Tool results: ${toolResults.length}`);
+        log(`============= END REQUEST INFO =============\n`);
       }
+      
+      // Call Anthropic with our maintained conversation history
+      const response = await this.client.sendMessage(
+        // Use our maintained history instead of just this turn's input
+        this.conversationHistory,
+        {
+          model: this.model,
+          system: options.system,
+          temperature: temperature,
+          // Pass session ID for consistency
+          conversationId: this.sessionId,
+          previousResponseId: this.lastResponseId,
+          // Always include shell tool
+          tools: this.client.getToolsForCodex(),
+          // Pass thinking config
+          thinking: options.thinking,
+          // Always stream
+          stream: true,
+          // Pass tool results
+          toolResults: toolResults,
+        }
+      );
       
       return response;
     } catch (error) {
