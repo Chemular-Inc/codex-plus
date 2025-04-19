@@ -38,12 +38,23 @@ function mapOpenAIInputToAnthropic(
   const messages: Array<AnthropicMessage> = [];
   const toolResults: Array<AnthropicToolResult> = [];
   
+  if (isLoggingEnabled()) {
+    log(`Converting ${input.length} messages to Anthropic format`);
+  }
+  
+  // First pass - collect all messages, including the last assistant message
+  // This is critical since we need the entire conversation history
   for (const item of input) {
     if (item.type === "message") {
       const message: AnthropicMessage = {
         role: item.role as "user" | "assistant" | "system",
         content: [],
       };
+      
+      // Log message details for debugging
+      if (isLoggingEnabled()) {
+        log(`Processing message - role: ${item.role}, content items: ${item.content.length}`);
+      }
       
       // Safely process each content item
       for (const contentItem of item.content) {
@@ -52,6 +63,14 @@ function mapOpenAIInputToAnthropic(
             type: "text", 
             text: contentItem.text 
           });
+          
+          if (isLoggingEnabled()) {
+            // Log truncated content for debugging
+            const previewText = contentItem.text.length > 50 
+              ? contentItem.text.substring(0, 50) + "..." 
+              : contentItem.text;
+            log(`Added text content: "${previewText}"`);
+          }
         } else if (contentItem.type === "input_image" && "image_url" in contentItem) {
           // Convert to base64 if needed
           message.content.push({
@@ -62,12 +81,20 @@ function mapOpenAIInputToAnthropic(
               data: contentItem.image_url.replace(/^data:image\/[^;]+;base64,/, ""),
             },
           });
+          
+          if (isLoggingEnabled()) {
+            log(`Added image content`);
+          }
         }
         // Skip other content types not supported by Anthropic
       }
       
       if (message.content.length > 0) {
         messages.push(message);
+        
+        if (isLoggingEnabled()) {
+          log(`Added message with role: ${message.role}, content items: ${message.content.length}`);
+        }
       }
     } else if (item.type === "function_call_output" && "call_id" in item) {
       // Convert function outputs to tool results
@@ -75,7 +102,23 @@ function mapOpenAIInputToAnthropic(
         tool_use_id: item.call_id,
         output: item.output,
       });
+      
+      if (isLoggingEnabled()) {
+        log(`Added tool result for call_id: ${item.call_id}`);
+      }
     }
+  }
+  
+  if (isLoggingEnabled()) {
+    log(`Mapped to ${messages.length} messages and ${toolResults.length} tool results`);
+    
+    // Show the conversation flow for debugging
+    let conversationPreview = "Conversation flow: ";
+    for (const msg of messages) {
+      conversationPreview += `[${msg.role}] → `;
+    }
+    conversationPreview += "[end]";
+    log(conversationPreview);
   }
   
   return { messages, toolResults };
