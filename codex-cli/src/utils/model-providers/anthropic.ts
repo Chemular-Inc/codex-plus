@@ -223,7 +223,7 @@ class AnthropicClient {
             temperature: number;
             system?: string;
             tools?: Array<AnthropicTool>;
-            tool_choice?: string;
+            tool_choice?: { type: string };
             tool_results?: Array<AnthropicToolResult>;
           }
           
@@ -266,8 +266,8 @@ class AnthropicClient {
             }
           ];
           
-          // Always set tool_choice to auto to encourage model to use tools
-          requestBody.tool_choice = "auto";
+          // Set tool_choice as object per Anthropic API requirements
+          requestBody.tool_choice = { type: "auto" };
           
           // Add tool results if available
           if (toolResults.length > 0 || (options?.toolResults && options.toolResults.length > 0)) {
