@@ -242,8 +242,8 @@ class AnthropicClient {
             tool_choice?: { type: string };
             tool_results?: Array<AnthropicToolResult>;
             thinking?: { 
-              type: "structured";
-              budget_tokens: number;
+              type: "enabled" | "disabled";
+              budget_tokens?: number;
             };
             stream?: boolean;
           }
@@ -259,12 +259,12 @@ class AnthropicClient {
           if (model.includes('claude-3-7') || model.includes('claude-3.7')) {
             if (options?.thinking) {
               requestBody.thinking = { 
-                type: "structured",
+                type: "enabled",
                 budget_tokens: options.thinking.budgetTokens 
               };
             } else {
               requestBody.thinking = { 
-                type: "structured",
+                type: "enabled",
                 budget_tokens: 3000 // Default token budget
               };
             }
@@ -327,9 +327,8 @@ First use the shell tool to gather information before responding substantively.
             ];
           }
           
-          if (isLoggingEnabled()) {
-            log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
-          }
+          // Always log the request body for debugging the thinking parameter
+          console.log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
           
           // Always stream
           requestBody.stream = true;
