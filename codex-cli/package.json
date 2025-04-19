@@ -1,5 +1,5 @@
 {
-  "name": "@jhanlon/codex-plus",
+  "name": "codex-plus",
   "version": "1.0.0-beta.1",
   "publishConfig": {
     "access": "public"
