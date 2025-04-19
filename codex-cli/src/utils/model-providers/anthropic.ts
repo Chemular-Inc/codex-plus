@@ -327,8 +327,9 @@ First use the shell tool to gather information before responding substantively.
             ];
           }
           
-          // Always log the request body for debugging the thinking parameter
-          console.log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
+          if (isLoggingEnabled()) {
+            log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
+          }
           
           // Always stream
           requestBody.stream = true;
