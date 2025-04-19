@@ -1,12 +1,12 @@
 {
-  "name": "codex-plus-cli",
-  "version": "0.1.0-beta.6",
+  "name": "@jhanlon/codex-plus",
+  "version": "1.0.0-beta.1",
   "publishConfig": {
     "access": "public"
   },
   "license": "Apache-2.0",
   "bin": {
-    "codex-plus": "bin/codex.js"
+    "codex-plus": "bin/codex-plus.js"
   },
   "type": "module",
   "engines": {
