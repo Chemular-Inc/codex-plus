@@ -513,19 +513,30 @@ First use the shell tool to gather information before responding substantively.
                         if (textContent) {
                           fullTextContent += textContent;
                           
-                          // Format compatible with OpenAI streaming
+                          // This is the critical part: 
+                          // We need to match exactly what the agent-loop expects from OpenAI
+                          // 1. Send a delta event with ONLY the new text (not accumulated)
+                          // 2. If we don't have a stable message ID, we need to reuse the same one
+                          // 3. Delta events MUST match the exact format expected by the agent
+                          
+                          const stableMessageId = messageId || `message-${responseId || Date.now()}`;
+                          
+                          if (isLoggingEnabled()) {
+                            log(`Generating delta with new text: "${textContent}" (${textContent.length} chars)`);
+                          }
+                          
                           yield {
-                            type: "response.output_item.delta",
+                            type: "response.output_item.delta", // Match OpenAI's delta event type exactly
                             delta: { 
-                              text: textContent 
+                              text: textContent // This is just the current delta
                             },
                             item: {
-                              id: messageId || `message-${Date.now()}`,
-                              type: "message",
-                              role: "assistant",
+                              id: stableMessageId, // IMPORTANT: Use a stable message ID
+                              type: "message", // Must match expected type
+                              role: "assistant", // Must be 'assistant' for proper role tracking
                               content: [{ 
-                                type: "output_text", 
-                                text: fullTextContent 
+                                type: "output_text", // Must be 'output_text' to match expected type
+                                text: fullTextContent // Send the ENTIRE accumulated text
                               }],
                             }
                           };
@@ -543,43 +554,39 @@ First use the shell tool to gather information before responding substantively.
                           }
                         };
                       } else if (data.type === "message_stop") {
-                        // Send final complete message
-                        if (fullTextContent) {
-                          // Create a unique message ID that includes response ID for tracking
-                          const finalMessageId = messageId || `${responseId}-message-${Date.now()}`;
-                          
-                          yield {
-                            type: "response.output_item.done",
-                            item: {
-                              id: finalMessageId,
-                              type: "message",
-                              role: "assistant",
-                              content: [{ 
-                                type: "output_text", 
-                                text: fullTextContent 
-                              }],
-                            }
-                          };
-                          
-                          if (isLoggingEnabled()) {
-                            log(`Yielded final message with ID: ${finalMessageId}, content length: ${fullTextContent.length}`);
-                          }
+                        // IMPORTANT: This is where we create the completed response that the agent needs
+                        // The agent loop expects:
+                        // 1. A "response.completed" event with the response ID
+                        // 2. The response ID must be set correctly for context tracking
+                        
+                        // Save the stableMessageId for consistency in the output
+                        const stableMessageId = messageId || `message-${responseId || Date.now()}`;
+                        
+                        if (isLoggingEnabled()) {
+                          log(`Message complete with ID: ${responseId}, content length: ${fullTextContent.length}`);
                         }
                         
-                        // End of message - THIS IS CRITICAL
-                        // The response.id MUST be passed back to maintain conversation context
+                        // We need to match EXACTLY how OpenAI formats completion events
+                        // The agent-loop.ts expects this exact format to update lastResponseId
                         yield {
                           type: "response.completed",
                           response: {
-                            id: responseId, // This gets stored as lastResponseId in agent-loop
+                            id: responseId, // CRITICAL: This is stored as lastResponseId in agent-loop
                             status: "completed",
-                            // Empty output since we've already yielded the individual items
-                            output: []
+                            output: [{
+                              id: stableMessageId,
+                              type: "message",
+                              role: "assistant",
+                              content: [{
+                                type: "output_text",
+                                text: fullTextContent
+                              }]
+                            }]
                           }
                         };
                         
                         if (isLoggingEnabled()) {
-                          log(`Yielded completed response with ID: ${responseId}`);
+                          log(`Yielded response.completed with ID: ${responseId}`);
                         }
                       }
                     } catch (e) {
