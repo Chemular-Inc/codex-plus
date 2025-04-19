@@ -238,6 +238,7 @@ class AnthropicClient {
             tools?: Array<AnthropicTool>;
             tool_choice?: { type: string };
             tool_results?: Array<AnthropicToolResult>;
+            thinking?: { enable: boolean };
           }
           
           const requestBody: AnthropicRequestBody = {
@@ -246,6 +247,11 @@ class AnthropicClient {
             max_tokens: options?.maxTokens || 4096,
             temperature: options?.temperature || 0.7,
           };
+          
+          // Add thinking parameter for Claude 3.7+ models
+          if (model.includes('claude-3-7') || model.includes('claude-3.7')) {
+            requestBody.thinking = { enable: true };
+          }
           
           // Add system instruction if provided
           if (options?.system) {
@@ -289,8 +295,8 @@ When asked to look at code, search for files, or perform any operations:
           ];
           
           // Set tool_choice as object per Anthropic API requirements
-          // Force tool usage by setting to a more assertive value
-          requestBody.tool_choice = { type: "any" };
+          // Use "auto" to match OpenAI's approach - the model decides when to use tools
+          requestBody.tool_choice = { type: "auto" };
           
           // Add tool results if available
           if (toolResults.length > 0 || (options?.toolResults && options.toolResults.length > 0)) {
