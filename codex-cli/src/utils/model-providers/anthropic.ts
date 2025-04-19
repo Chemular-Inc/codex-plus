@@ -11,32 +11,25 @@ import { ModelProvider, ProviderOptions, ModelProviderInterface, providerRegistr
 import { normalizeModelName } from "../model-utils.js";
 
 // Types mirroring Anthropic API structures
-type AnthropicMessage = {
+interface AnthropicMessage {
   role: "user" | "assistant" | "system";
-  content: Array<AnthropicContent>;
-};
+  content: AnthropicContent[];
+}
 
 type AnthropicContent = 
   | { type: "text"; text: string }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 
-type AnthropicTool = {
+interface AnthropicTool {
   name: string;
   description: string;
-  input_schema: object;
-};
+  input_schema: Record<string, unknown>;
+}
 
-// Type for tool use structure from Anthropic API
-type AnthropicToolUse = {
-  id: string;
-  name: string;
-  input: object;
-};
-
-type AnthropicToolResult = {
+interface AnthropicToolResult {
   tool_use_id: string;
-  output: string | object;
-};
+  output: string | Record<string, unknown>;
+}
 
 // Mapping function between OpenAI and Anthropic formats
 function mapOpenAIInputToAnthropic(
@@ -52,10 +45,14 @@ function mapOpenAIInputToAnthropic(
         content: [],
       };
       
+      // Safely process each content item
       for (const contentItem of item.content) {
         if (contentItem.type === "input_text" || contentItem.type === "output_text") {
-          message.content.push({ type: "text", text: contentItem.text });
-        } else if (contentItem.type === "input_image") {
+          message.content.push({ 
+            type: "text", 
+            text: contentItem.text 
+          });
+        } else if (contentItem.type === "input_image" && "image_url" in contentItem) {
           // Convert to base64 if needed
           message.content.push({
             type: "image",
@@ -72,7 +69,7 @@ function mapOpenAIInputToAnthropic(
       if (message.content.length > 0) {
         messages.push(message);
       }
-    } else if (item.type === "function_call_output") {
+    } else if (item.type === "function_call_output" && "call_id" in item) {
       // Convert function outputs to tool results
       toolResults.push({
         tool_use_id: item.call_id,
@@ -101,20 +98,19 @@ function mapAnthropicResponseToOpenAI(
   // This is important because the agent loop processes items in order
   if (anthropicResponse.tool_uses && anthropicResponse.tool_uses.length > 0) {
     for (const toolUse of anthropicResponse.tool_uses) {
-      // Create function call item
+      // Create function call item with proper typing
       const functionCallItem: ResponseItem = {
-        id: toolUse.id,
+        id: toolUse.id || `tool-${Date.now()}`,
         type: "function_call",
         name: toolUse.name,
-        call_id: toolUse.id,
+        call_id: toolUse.id || `tool-${Date.now()}`,
         arguments: JSON.stringify(toolUse.input),
       };
       
       // For shell commands, make sure the argument format is compatible
-      if (toolUse.name === "shell" && typeof toolUse.input === "object") {
-        // If command is a string, convert it to array format that OpenAI expects
-        const input = toolUse.input as any;
-        if (typeof input.command === "string") {
+      if (toolUse.name === "shell" && toolUse.input && typeof toolUse.input === "object") {
+        const input = toolUse.input as Record<string, unknown>;
+        if (input.command && typeof input.command === "string") {
           const commandArgs = input.command.split(/\s+/).filter(Boolean);
           if (commandArgs.length > 0) {
             const newArguments = {
@@ -131,24 +127,29 @@ function mapAnthropicResponseToOpenAI(
   }
   
   // Map the main message content after tool calls
-  if (anthropicResponse.content) {
-    const messageItem: ResponseItem = {
-      id: `${conversationId}-message`,
-      type: "message",
-      role: "assistant",
-      content: anthropicResponse.content.map((contentBlock) => {
-        if (contentBlock.type === "text") {
-          return {
-            type: "output_text",
-            text: contentBlock.text,
-          };
-        }
-        // Handle other content types as needed
-        return null;
-      }).filter(Boolean),
-    };
+  if (anthropicResponse.content && anthropicResponse.content.length > 0) {
+    // Create properly typed content array for the message
+    const content: Array<{ type: string; text: string }> = [];
     
-    responseItems.push(messageItem);
+    for (const contentBlock of anthropicResponse.content) {
+      if (contentBlock.type === "text" && contentBlock.text) {
+        content.push({
+          type: "output_text",
+          text: contentBlock.text,
+        });
+      }
+    }
+    
+    if (content.length > 0) {
+      const messageItem: ResponseItem = {
+        id: `${conversationId}-message`,
+        type: "message",
+        role: "assistant",
+        content,
+      };
+      
+      responseItems.push(messageItem);
+    }
   }
   
   // Ensure we always have at least an empty message if nothing else
@@ -196,8 +197,10 @@ class AnthropicClient {
       conversationId?: string;
       tools?: Array<AnthropicTool>;
       toolResults?: Array<AnthropicToolResult>;
+      thinking?: { budgetTokens: number };
+      stream?: boolean;
     }
-  ): Promise<{ items: Array<ResponseItem>; response_id: string }> {
+  ): Promise<AsyncIterable<any>> {
     // Use normalized model name to ensure compatibility with Anthropic API
     const rawModel = options?.model || this.defaultModel;
     const model = normalizeModelName(rawModel);
@@ -238,7 +241,11 @@ class AnthropicClient {
             tools?: Array<AnthropicTool>;
             tool_choice?: { type: string };
             tool_results?: Array<AnthropicToolResult>;
-            thinking?: { enable: boolean };
+            thinking?: { 
+              type: "structured";
+              budget_tokens: number;
+            };
+            stream?: boolean;
           }
           
           const requestBody: AnthropicRequestBody = {
@@ -250,7 +257,17 @@ class AnthropicClient {
           
           // Add thinking parameter for Claude 3.7+ models
           if (model.includes('claude-3-7') || model.includes('claude-3.7')) {
-            requestBody.thinking = { enable: true };
+            if (options?.thinking) {
+              requestBody.thinking = { 
+                type: "structured",
+                budget_tokens: options.thinking.budgetTokens 
+              };
+            } else {
+              requestBody.thinking = { 
+                type: "structured",
+                budget_tokens: 3000 // Default token budget
+              };
+            }
           }
           
           // Add system instruction if provided
@@ -314,6 +331,9 @@ First use the shell tool to gather information before responding substantively.
             log(`Sending request to Anthropic: ${JSON.stringify(requestBody, null, 2)}`);
           }
           
+          // Always stream
+          requestBody.stream = true;
+          
           // Make the API call with better error handling
           const response = await fetch(`${this.baseUrl}/messages`, {
             method: "POST",
@@ -321,7 +341,6 @@ First use the shell tool to gather information before responding substantively.
               "x-api-key": this.apiKey,
               "anthropic-version": "2023-06-01",
               "content-type": "application/json",
-              // "anthropic-beta": "tools-2023-12-15", // Removed - no longer supported
             },
             body: JSON.stringify(requestBody),
           });
@@ -329,7 +348,7 @@ First use the shell tool to gather information before responding substantively.
           if (!response.ok) {
             // Get error details
             const errorText = await response.text();
-            let errorObj: Record<string, any> = {};
+            let errorObj: Record<string, unknown> = {};
             
             try {
               errorObj = JSON.parse(errorText);
@@ -353,16 +372,26 @@ First use the shell tool to gather information before responding substantively.
               errorObj.headers[key] = value;
             });
             
-            // Only apply rate limit special casing when it's actually a rate limit
-            // Don't transform other error types
+            // Normalize error types for consistent handling
             if (response.status === 429 || 
-                (errorObj.error?.type === 'rate_limit_error') ||
-                (errorObj.error?.message && errorObj.error.message.includes('rate limit'))) {
+                (errorObj.error && typeof errorObj.error === 'object' && 
+                 'type' in errorObj.error && errorObj.error.type === 'rate_limit_error') ||
+                (errorObj.error && typeof errorObj.error === 'object' && 
+                 'message' in errorObj.error && typeof errorObj.error.message === 'string' && 
+                 errorObj.error.message.includes('rate limit'))) {
               errorObj.type = 'rate_limit_error';
             }
             
             // Create a proper error with the detailed message
-            const errorMsg = errorObj.error?.message || errorObj.message || errorText;
+            let errorMsg = '';
+            if (errorObj.error && typeof errorObj.error === 'object' && 'message' in errorObj.error) {
+              errorMsg = String(errorObj.error.message);
+            } else if ('message' in errorObj) {
+              errorMsg = String(errorObj.message);
+            } else {
+              errorMsg = errorText;
+            }
+            
             const error = new Error(`Anthropic API Error (${response.status}): ${errorMsg}`);
             
             // Attach the original error details for debugging
@@ -372,7 +401,127 @@ First use the shell tool to gather information before responding substantively.
             throw error;
           }
           
-          return response.json();
+          // Create an abort controller for the stream
+          const controller = new AbortController();
+          
+          // Get the reader
+          const reader = response.body?.getReader();
+          if (!reader) {
+            throw new Error("Failed to create reader from response");
+          }
+          
+          // Create an async generator to process the stream
+          const stream = (async function*() {
+              const decoder = new TextDecoder();
+              let buffer = "";
+              let responseId = "";
+              
+              // Handle abort signal
+              controller.signal.addEventListener('abort', () => {
+                reader.cancel('Aborted by user').catch(err => {
+                  if (isLoggingEnabled()) {
+                    log(`Error cancelling reader: ${String(err)}`);
+                  }
+                });
+              });
+              
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  
+                  buffer += decoder.decode(value, { stream: true });
+                  
+                  // Process events in the buffer
+                  const lines = buffer.split('\n\n');
+                  buffer = lines.pop() || ""; // Keep the last line which might be incomplete
+                  
+                  for (const line of lines) {
+                    if (!line.trim() || line.trim() === "data: [DONE]") continue;
+                    
+                    const dataMatch = line.match(/^data: (.+)$/m);
+                    if (!dataMatch) continue;
+                    
+                    try {
+                      const data = JSON.parse(dataMatch[1]);
+                      
+                      if (data.type === "message_start") {
+                        responseId = data.message.id;
+                        // Generate unique message ID based on the response ID
+                        const messageId = `${responseId}-message`;
+                        
+                        // Some models send initial content in the message_start event
+                        if (data.message?.content && data.message.content.length > 0) {
+                          for (const content of data.message.content) {
+                            if (content.type === "text" && content.text) {
+                              yield {
+                                type: "response.output_item.done",
+                                item: {
+                                  id: messageId,
+                                  type: "message",
+                                  role: "assistant",
+                                  content: [{ type: "output_text", text: content.text }],
+                                }
+                              };
+                            }
+                          }
+                        }
+                      } else if (data.type === "content_block_start" || data.type === "content_block_delta") {
+                        // Handle message content blocks
+                        const textContent = data.content_block?.text || data.delta?.text;
+                        if (textContent) {
+                          // Generate a stable ID for content items
+                          const contentId = data.content_block?.id || `${responseId}-content-${Date.now()}`;
+                          yield {
+                            type: "response.output_item.done",
+                            item: {
+                              id: contentId,
+                              type: "message",
+                              role: "assistant",
+                              content: [{ type: "output_text", text: textContent }],
+                            }
+                          };
+                        }
+                      } else if (data.type === "tool_use") {
+                        // Handle tool usage
+                        yield {
+                          type: "response.output_item.done",
+                          item: {
+                            id: data.id || `${responseId}-tool-${Date.now()}`,
+                            type: "function_call",
+                            name: data.tool_use.name,
+                            call_id: data.tool_use.id,
+                            arguments: JSON.stringify(data.tool_use.input),
+                          }
+                        };
+                      } else if (data.type === "message_stop") {
+                        // End of message
+                        yield {
+                          type: "response.completed",
+                          response: {
+                            id: responseId,
+                            status: "completed",
+                            // Empty output since we already yielded the individual items
+                            output: []
+                          }
+                        };
+                      }
+                    } catch (e) {
+                      if (isLoggingEnabled()) {
+                        log(`Error parsing SSE event: ${e instanceof Error ? e.message : String(e)}`);
+                      }
+                    }
+                  }
+                }
+              } finally {
+                reader.releaseLock();
+              }
+            })();
+            
+          // Add controller to stream for abort support
+          (stream as any).controller = controller;
+          
+          return stream;
         },
         {
           estimatedTokens,
@@ -574,11 +723,9 @@ class AnthropicProvider implements ModelProviderInterface {
       temperature?: number;
       previousResponseId?: string;
       conversationId?: string;
+      thinking?: { budgetTokens: number };
     }
-  ): Promise<{
-    items: Array<ResponseItem>;
-    response_id: string;
-  }> {
+  ): Promise<AsyncIterable<any>> {
     try {
       // Make sure client is initialized
       await this.initializeClient();
@@ -591,29 +738,33 @@ class AnthropicProvider implements ModelProviderInterface {
         }
       }
       
-      // Pass conversation ID from previousResponseId if available
-      const conversationId = options.previousResponseId ? 
-        options.previousResponseId : 
-        options.conversationId || `conv_${Date.now()}`;
+      // Handle conversation context properly - this is critical for maintaining context
+      let conversationId = options.conversationId || `conv_${Date.now()}`;
       
-      const result = await this.client.sendMessage(input, {
+      // If we have a previous response ID from the same conversation, use that
+      if (options.previousResponseId) {
+        conversationId = options.previousResponseId;
+      }
+      
+      if (isLoggingEnabled()) {
+        log(`Using conversation ID: ${conversationId}`);
+        log(`Previous response ID: ${options.previousResponseId || "none"}`);
+        log(`Explicit conversation ID: ${options.conversationId || "none"}`);
+      }
+      
+      // Only streaming (matching OpenAI behavior)
+      return await this.client.sendMessage(input, {
         model: this.model,
         system: options.system,
         temperature: options.temperature || 0.7,
-        conversationId: conversationId,
+        conversationId,
         // Always include shell tool to match OpenAI capability
         tools: this.client.getToolsForCodex(),
+        // Pass thinking configuration if provided
+        thinking: options.thinking,
+        // Always stream - this matches the OpenAI behavior
+        stream: true
       });
-      
-      if (isLoggingEnabled()) {
-        log(`Anthropic response contains ${result.items.length} items`);
-        const toolCalls = result.items.filter(item => item.type === "function_call").length;
-        if (toolCalls > 0) {
-          log(`Response includes ${toolCalls} tool calls`);
-        }
-      }
-      
-      return result;
     } catch (error) {
       if (isLoggingEnabled()) {
         log(`Error in Anthropic provider: ${error instanceof Error ? error.message : String(error)}`);
