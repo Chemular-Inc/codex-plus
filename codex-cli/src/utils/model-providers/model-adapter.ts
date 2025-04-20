@@ -134,14 +134,35 @@ export class ModelAdapter {
       model: this.modelId,
       messages: chatMessages,
       system: instructions,
-      tools: [{
-        type: "function",
-        name: "shell",
-        description: "Runs a shell command, and returns its output."
-      }],
+      tools: this.provider.getToolDefinitions
+        ? this.provider.getToolDefinitions()
+        : [{
+            type: "function",
+            name: "shell",
+            description: "Runs a shell command, and returns its output.",
+            ...(this.providerName === "openai" && {
+              strict: false,
+              parameters: {
+                type: "object",
+                properties: {
+                  command: { type: "array", items: { type: "string" } },
+                  workdir: {
+                    type: "string",
+                    description: "The working directory for the command.",
+                  },
+                  timeout: {
+                    type: "number",
+                    description: "The maximum time to wait for the command to complete in milliseconds.",
+                  },
+                },
+                required: ["command"],
+                additionalProperties: false,
+              },
+            }),
+          }],
       stream: true,
       extras: {
-        // Include original messages as input for the OpenAI provider
+        // Include original messages as input for the provider
         input: messages
       }
     };

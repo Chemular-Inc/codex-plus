@@ -101,4 +101,10 @@ export interface ModelProvider {
    * Get the API key for this provider from environment variables or config
    */
   getApiKey(configApiKey?: string): string;
+  
+  /**
+   * Get provider-specific tool definitions
+   * Optional method that returns custom tool definitions for this provider
+   */
+  getToolDefinitions?(): Array<ModelTool>;
 }
