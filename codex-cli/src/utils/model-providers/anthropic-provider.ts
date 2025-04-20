@@ -96,28 +96,47 @@ export class AnthropicProvider implements ModelProvider {
           }
         });
         
-        // File editor tool - using a standard function approach for Claude 3.7 compatibility
+        // Add the proper str_replace_editor tool based on Anthropic documentation
         tools.push({
-          name: "file_editor",
-          description: "Edit text files using view, edit, and create operations.",
+          name: "str_replace_editor",
+          description: "Edit text files using commands like view, str_replace, create, and insert.",
           input_schema: {
             type: "object",
             properties: {
-              operation: {
+              command: {
                 type: "string",
-                enum: ["view", "edit", "create"],
-                description: "The operation to perform on the file"
+                enum: ["view", "str_replace", "create", "insert", "undo_edit"],
+                description: "The operation to perform"
               },
               path: {
                 type: "string",
-                description: "The absolute path to the file"
+                description: "The absolute path to the file or directory"
               },
-              content: {
+              view_range: {
+                type: "array",
+                items: {
+                  type: "integer",
+                },
+                description: "Optional range of lines to view [start, end] (for view command)"
+              },
+              file_text: {
                 type: "string",
-                description: "The content to write (for edit and create operations)"
+                description: "The content to write to the file (for create command)"
+              },
+              old_str: {
+                type: "string",
+                description: "The text to be replaced (for str_replace command)"
+              },
+              new_str: {
+                type: "string",
+                description: "The replacement text (for str_replace and insert commands)"
+              },
+              insert_line: {
+                type: "integer",
+                description: "The line number to insert text at (for insert command)"
               }
             },
-            required: ["operation", "path"]
+            required: ["command", "path"]
           }
         });
       }
@@ -130,21 +149,26 @@ export class AnthropicProvider implements ModelProvider {
         stream: true,
       };
       
-      // Add tools if available - but handle Claude 3.7 differently
+      // Add tools if available - with correct tool_choice format
       if (tools.length > 0) {
-        // Check if this is a Claude 3.7 model - they have unique tool handling requirements
+        // Check if this is a Claude 3.7 model
         const isClaude37 = request.model.includes("claude-3-7") || request.model.includes("claude-3.7");
         
-        if (isClaude37) {
-          if (isLoggingEnabled()) {
-            log(`AnthropicProvider: Claude 3.7 detected, using modified tool configuration`);
-          }
-          
-          // For Claude 3.7, we don't use tool_choice as it's not supported in the same way
-          params.tools = tools;
-        } else {
-          params.tools = tools;
+        // Add tools to params
+        params.tools = tools;
+        
+        // According to Anthropic docs, tool_choice can be one of:
+        // - "auto" (default): Claude decides whether to use provided tools
+        // - "any": Claude must use one of the provided tools
+        // - {"type": "tool", "name": "TOOL_NAME"}: Forces Claude to use a specific tool
+        // - "none": Prevents Claude from using any tools
+        
+        // For our case, we'll use "auto" to let Claude decide when to use tools
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider: Setting tool_choice to "auto" for ${isClaude37 ? 'Claude 3.7' : 'Claude'}`);
         }
+        
+        params.tool_choice = "auto";
       }
       
       // Add temperature if provided
@@ -266,9 +290,38 @@ export class AnthropicProvider implements ModelProvider {
                 }
               }
               
-              // Convert file_editor to expected str_replace_editor format if needed
-              if (currentToolUse.name === "file_editor") {
-                currentToolUse.name = "str_replace_editor";
+              // No need to convert file_editor to str_replace_editor anymore,
+              // as we're using the correct name (str_replace_editor) from the start
+              
+              // Ensure the tool call is in the expected format with the right fields
+              if (currentToolUse.name === "str_replace_editor") {
+                // Check if we need to convert format
+                if (currentToolUse.input && !currentToolUse.input.command && 
+                    (currentToolUse.input.operation || currentToolUse.input.content)) {
+                  // Convert from old format to correct str_replace_editor format
+                  const newInput: any = {
+                    path: currentToolUse.input.path
+                  };
+                  
+                  // Map operation to command
+                  if (currentToolUse.input.operation === "view") {
+                    newInput.command = "view";
+                  } else if (currentToolUse.input.operation === "edit") {
+                    newInput.command = "str_replace";
+                    newInput.old_str = ""; // Will need to be filled by actual text
+                    newInput.new_str = currentToolUse.input.content || "";
+                  } else if (currentToolUse.input.operation === "create") {
+                    newInput.command = "create";
+                    newInput.file_text = currentToolUse.input.content || "";
+                  }
+                  
+                  // Update the input
+                  currentToolUse.input = newInput;
+                  
+                  if (isLoggingEnabled()) {
+                    log(`AnthropicProvider: Converted text editor format: ${JSON.stringify(currentToolUse.input)}`);
+                  }
+                }
               }
               
               // Use the same structure as OpenAI for maximum compatibility
@@ -408,14 +461,48 @@ export class AnthropicProvider implements ModelProvider {
         toolCallItem.arguments = JSON.stringify(toolCallItem.arguments);
       }
       
-      // Map tool names if needed - file_editor should map to str_replace_editor
-      if (toolCallItem.name === 'file_editor') {
-        toolCallItem.name = 'str_replace_editor';
-        
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider.processToolCall: Mapped file_editor to str_replace_editor`);
+      // We're now consistently using str_replace_editor, but handle any older format conversions
+      if (toolCallItem.name === 'str_replace_editor') {
+        try {
+          const args = typeof toolCallItem.arguments === 'string' 
+            ? JSON.parse(toolCallItem.arguments) 
+            : toolCallItem.arguments;
+            
+          // Check if we need to convert from old format to new
+          if (args && args.operation && !args.command) {
+            // Convert from old format (operation, content) to new format (command, file_text, etc.)
+            const newArgs: any = {
+              path: args.path
+            };
+            
+            // Map operation to command
+            if (args.operation === "view") {
+              newArgs.command = "view";
+            } else if (args.operation === "edit") {
+              newArgs.command = "str_replace";
+              newArgs.old_str = ""; // This will be problematic without actual text
+              newArgs.new_str = args.content || "";
+            } else if (args.operation === "create") {
+              newArgs.command = "create";
+              newArgs.file_text = args.content || "";
+            }
+            
+            // Update the arguments
+            toolCallItem.arguments = JSON.stringify(newArgs);
+            
+            if (isLoggingEnabled()) {
+              log(`AnthropicProvider.processToolCall: Converted str_replace_editor args format: ${JSON.stringify(newArgs)}`);
+            }
+          }
+        } catch (e) {
+          // If parsing fails, leave as is
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider.processToolCall: Error parsing str_replace_editor args: ${e}`);
+          }
         }
       }
+      
+      // File editor name mapping would have been here, but we're now using str_replace_editor directly
       
       // Handle shell tool arguments format
       if (toolCallItem.name === 'shell' && toolCallItem.arguments) {
@@ -650,29 +737,48 @@ export class AnthropicProvider implements ModelProvider {
           required: ["command"]
         }
       },
-      // Standard editor tool that works across all Claude versions
+      // Standard editor tool using the proper Anthropic str_replace_editor format
       {
         type: "function",
-        name: "file_editor",
-        description: "Edit text files using view, edit, and create operations.",
+        name: "str_replace_editor",
+        description: "Edit text files using commands like view, str_replace, create, and insert.",
         parameters: {
           type: "object",
           properties: {
-            operation: {
+            command: {
               type: "string",
-              enum: ["view", "edit", "create"],
-              description: "The operation to perform on the file"
+              enum: ["view", "str_replace", "create", "insert", "undo_edit"],
+              description: "The operation to perform"
             },
             path: {
               type: "string",
-              description: "The absolute path to the file"
+              description: "The absolute path to the file or directory"
             },
-            content: {
+            view_range: {
+              type: "array",
+              items: {
+                type: "integer",
+              },
+              description: "Optional range of lines to view [start, end] (for view command)"
+            },
+            file_text: {
               type: "string",
-              description: "The content to write (for edit and create operations)"
+              description: "The content to write to the file (for create command)"
+            },
+            old_str: {
+              type: "string",
+              description: "The text to be replaced (for str_replace command)"
+            },
+            new_str: {
+              type: "string",
+              description: "The replacement text (for str_replace and insert commands)"
+            },
+            insert_line: {
+              type: "integer",
+              description: "The line number to insert text at (for insert command)"
             }
           },
-          required: ["operation", "path"]
+          required: ["command", "path"]
         }
       }
     ];
