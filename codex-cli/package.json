@@ -1,6 +1,6 @@
 {
   "name": "@j_hanlon/codex-plus",
-  "version": "0.1.2-beta.29",
+  "version": "0.1.2-beta.30",
   "license": "Apache-2.0",
   "bin": {
     "codex-plus": "bin/codex.js"

@@ -290,6 +290,10 @@ export class AgentLoop {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callId: string = (item as any).call_id ?? (item as any).id;
 
+    if (isLoggingEnabled()) {
+      log(`Using call ID: ${callId} for function call`);
+    }
+
     const args = parseToolCallArguments(rawArguments ?? "{}");
     if (isLoggingEnabled()) {
       log(
@@ -302,7 +306,7 @@ export class AgentLoop {
     if (args == null) {
       const outputItem: ResponseInputItem.FunctionCallOutput = {
         type: "function_call_output",
-        call_id: item.call_id,
+        call_id: callId,
         output: `invalid arguments: ${rawArguments}`,
       };
       return [outputItem];
@@ -351,7 +355,27 @@ export class AgentLoop {
       }
     }
 
-    return [outputItem, ...additionalItems];
+    // Make sure all output items have proper call_id for reliability
+    const results = [outputItem, ...additionalItems];
+    if (isLoggingEnabled()) {
+      log(`Function call with ID ${callId} produced ${results.length} output items`);
+      for (const result of results) {
+        if (result.type === "function_call_output") {
+          log(`Function call output: call_id=${result.call_id}, length=${result.output?.length || 0}`);
+        }
+      }
+    }
+
+    // Ensure all output items have the correct call_id
+    return results.map(item => {
+      if (item.type === "function_call_output") {
+        return {
+          ...item,
+          call_id: callId
+        };
+      }
+      return item;
+    });
   }
 
   public async run(
@@ -786,23 +810,38 @@ export class AgentLoop {
     const turnInput: Array<ResponseInputItem> = [];
     for (const item of output) {
       if (isLoggingEnabled()) {
-        log(`Processing item of type: ${item.type}, id: ${(item as any).id || 'unknown'}`);
+        const itemId = (item as any).id || (item as any).call_id || 'unknown';
+        log(`Processing item of type: ${item.type}, id: ${itemId}`);
       }
       
       if (item.type === "function_call") {
-        // Use a safe access pattern for the id
-        const itemId = (item as any).id;
-        if (itemId && alreadyProcessedResponses.has(itemId)) {
+        // Extract the call ID - OpenAI items may have different ID field names
+        const callId: string = (item as any).call_id ?? (item as any).id;
+        
+        if (callId && alreadyProcessedResponses.has(callId)) {
           if (isLoggingEnabled()) {
-            log(`Skipping already processed function call: ${itemId}`);
+            log(`Skipping already processed function call: ${callId}`);
           }
           continue;
+        }
+        
+        // Make sure the item has both id and call_id set (for backward compatibility)
+        const normalizedItem = {...item};
+        if (callId) {
+          (normalizedItem as any).id = callId;
+          (normalizedItem as any).call_id = callId;
+          
+          if (isLoggingEnabled()) {
+            log(`Processing function call with ID: ${callId}`);
+          }
+        } else {
+          log(`Warning: Function call without ID!`);
         }
         
         // Use the model adapter to process tool calls
         // eslint-disable-next-line no-await-in-loop
         const result = await this.modelAdapter.processToolCall(
-          item as ResponseItem,
+          normalizedItem as ResponseItem,
           this.handleFunctionCall.bind(this)
         );
         
@@ -811,10 +850,22 @@ export class AgentLoop {
         }
         
         // Save ID to processed set if it exists
-        if ((item as any).id) {
-          alreadyProcessedResponses.add((item as any).id);
+        if (callId) {
+          alreadyProcessedResponses.add(callId);
         }
-        turnInput.push(...result);
+        
+        // Make sure all results have the call_id set correctly
+        const processedResults = result.map(outputItem => {
+          if (outputItem.type === "function_call_output" && callId) {
+            return {
+              ...outputItem,
+              call_id: callId
+            };
+          }
+          return outputItem;
+        });
+        
+        turnInput.push(...processedResults);
       }
       emitItem(item as ResponseItem);
     }
