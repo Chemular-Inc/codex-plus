@@ -140,69 +140,136 @@ export class AnthropicProvider implements ModelProvider {
       let messageId = "";
       
       // Process the stream
-      for await (const event of stream) {
-        // Type assertion for specific event types
-        if (event.type === "content_block_delta") {
-          // Cast to avoid TypeScript errors
-          const textDelta = event.delta as any;
-          if (textDelta && textDelta.type === "text_delta" && typeof textDelta.text === "string") {
-            // Content text
-            contentBuffer += textDelta.text;
-            yield { kind: "content", text: textDelta.text };
+      try {
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider: Starting to process stream events`);
+        }
+        
+        for await (const event of stream) {
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider: Raw event: ${JSON.stringify(event)}`);
           }
-        } else if (event.type === "message_delta") {
-          if (event.delta.stop_reason) {
-            // Get message ID if available
-            const anyEvent = event as any;
-            if (anyEvent.message && anyEvent.message.id) {
-              messageId = anyEvent.message.id;
+          
+          // Type assertion for specific event types
+          if (event.type === "content_block_delta") {
+            // Cast to avoid TypeScript errors
+            const textDelta = event.delta as any;
+            if (textDelta && textDelta.type === "text_delta" && typeof textDelta.text === "string") {
+              // Content text
+              contentBuffer += textDelta.text;
+              
+              if (isLoggingEnabled()) {
+                log(`AnthropicProvider: Text content: "${textDelta.text}"`);
+              }
+              
+              yield { kind: "content", text: textDelta.text };
+            } else {
+              if (isLoggingEnabled()) {
+                log(`AnthropicProvider: Unhandled content_block_delta: ${JSON.stringify(textDelta)}`);
+              }
+            }
+          } else if (event.type === "message_delta") {
+            if (isLoggingEnabled()) {
+              log(`AnthropicProvider: Message delta: ${JSON.stringify(event.delta)}`);
             }
             
-            // Message complete
-            yield { 
-              kind: "done", 
-              responseId: messageId
-            };
-          }
-        } else if (event.type === "content_block_start") {
-          // Cast to any to avoid TypeScript errors
-          const contentBlockStart = event as any;
-          if (contentBlockStart.content_block && contentBlockStart.content_block.type === "tool_use") {
-            // Tool use started
-            currentToolUse = {
-              id: contentBlockStart.content_block.id,
-              name: contentBlockStart.content_block.name,
-              input: contentBlockStart.content_block.input
-            };
+            if (event.delta.stop_reason) {
+              // Get message ID if available
+              const anyEvent = event as any;
+              if (anyEvent.message && anyEvent.message.id) {
+                messageId = anyEvent.message.id;
+                if (isLoggingEnabled()) {
+                  log(`AnthropicProvider: Got message ID: ${messageId}`);
+                }
+              }
+              
+              // Message complete
+              if (isLoggingEnabled()) {
+                log(`AnthropicProvider: Stream complete, yielding done event with messageId: ${messageId}`);
+              }
+              
+              yield { 
+                kind: "done", 
+                responseId: messageId
+              };
+            }
+          } else if (event.type === "content_block_start") {
+            // Cast to any to avoid TypeScript errors
+            const contentBlockStart = event as any;
             
             if (isLoggingEnabled()) {
-              log(`Tool use started: ${JSON.stringify(currentToolUse)}`);
+              log(`AnthropicProvider: Content block start: ${JSON.stringify(contentBlockStart)}`);
             }
-          }
-        } else if (event.type === "content_block_stop") {
-          // Cast to any to avoid TypeScript errors
-          const contentBlockStop = event as any;
-          if (contentBlockStop.content_block && 
-              contentBlockStop.content_block.type === "tool_use" && 
-              currentToolUse) {
-            // Tool use completed, emit tool call
-            const toolCall = {
-              type: "function_call",
-              id: currentToolUse.id,
-              call_id: currentToolUse.id,
-              name: currentToolUse.name,
-              arguments: JSON.stringify(currentToolUse.input),
-              status: "completed"
-            };
+            
+            if (contentBlockStart.content_block && contentBlockStart.content_block.type === "tool_use") {
+              // Tool use started
+              currentToolUse = {
+                id: contentBlockStart.content_block.id,
+                name: contentBlockStart.content_block.name,
+                input: contentBlockStart.content_block.input
+              };
+              
+              if (isLoggingEnabled()) {
+                log(`AnthropicProvider: Tool use started: ${JSON.stringify(currentToolUse)}`);
+              }
+            }
+          } else if (event.type === "content_block_stop") {
+            // Cast to any to avoid TypeScript errors
+            const contentBlockStop = event as any;
             
             if (isLoggingEnabled()) {
-              log(`Emitting tool call: ${JSON.stringify(toolCall)}`);
+              log(`AnthropicProvider: Content block stop: ${JSON.stringify(contentBlockStop)}`);
             }
             
-            yield { kind: "toolCall", call: toolCall };
-            currentToolUse = null;
+            if (contentBlockStop.content_block && 
+                contentBlockStop.content_block.type === "tool_use" && 
+                currentToolUse) {
+              // Tool use completed, emit tool call
+              const toolCall = {
+                type: "function_call",
+                id: currentToolUse.id,
+                call_id: currentToolUse.id,
+                name: currentToolUse.name,
+                arguments: JSON.stringify(currentToolUse.input),
+                status: "completed"
+              };
+              
+              if (isLoggingEnabled()) {
+                log(`AnthropicProvider: Emitting tool call: ${JSON.stringify(toolCall)}`);
+              }
+              
+              yield { kind: "toolCall", call: toolCall };
+              currentToolUse = null;
+            }
+          } else {
+            if (isLoggingEnabled()) {
+              log(`AnthropicProvider: Unhandled event type: ${event.type}`);
+            }
           }
         }
+        
+        // If we get here without yielding a "done" event, yield one now
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider: End of stream reached without stop_reason, yielding final done event`);
+        }
+        
+        // Only yield a done event if we haven't done so already (which would be indicated by messageId being set)
+        if (!messageId) {
+          yield { 
+            kind: "done", 
+            responseId: `anthropic-fallback-${Date.now()}`
+          };
+        }
+      } catch (streamError) {
+        log(`Error processing Anthropic stream events: ${streamError}`);
+        
+        // Make sure we yield a done event even on error, so the client doesn't hang
+        yield { 
+          kind: "done", 
+          responseId: `anthropic-error-${Date.now()}`
+        };
+        
+        throw streamError;
       }
     } catch (error) {
       log(`Error streaming from Anthropic: ${error}`);
@@ -238,44 +305,91 @@ export class AnthropicProvider implements ModelProvider {
     item: ResponseItem,
     handleFunctionCall: (item: any) => Promise<Array<ResponseInputItem>>
   ): Promise<Array<ResponseInputItem>> {
-    if (isLoggingEnabled()) {
-      log(`AnthropicProvider.processToolCall: Processing tool call: ${JSON.stringify(item)}`);
-    }
-    
-    // Extract the tool call ID
-    const callId = (item as any).call_id || (item as any).id;
-    
-    if (!callId) {
-      log("AnthropicProvider.processToolCall: No call_id found in tool call");
-      return [];
-    }
-    
-    // Create a copy of the item
-    const toolCallItem = JSON.parse(JSON.stringify(item));
-    
-    // Ensure the item has both call_id and id properties
-    toolCallItem.call_id = callId;
-    toolCallItem.id = callId;
-    
-    // Handle the function call
-    const result = await handleFunctionCall(toolCallItem);
-    
-    // Ensure all result items have the correct call_id
-    const finalResults = result.map(outputItem => {
-      if (outputItem.type === "function_call_output") {
-        return {
-          ...outputItem,
-          call_id: callId
-        };
+    try {
+      if (isLoggingEnabled()) {
+        log(`AnthropicProvider.processToolCall: Processing tool call: ${JSON.stringify(item)}`);
+        log(`AnthropicProvider.processToolCall: Item type: ${(item as any).type}`);
       }
-      return outputItem;
-    });
-    
-    if (isLoggingEnabled()) {
-      log(`AnthropicProvider.processToolCall: Results: ${JSON.stringify(finalResults)}`);
+      
+      // Extract the tool call ID
+      const callId = (item as any).call_id || (item as any).id;
+      
+      if (!callId) {
+        log("AnthropicProvider.processToolCall: No call_id found in tool call");
+        return [];
+      }
+      
+      if (isLoggingEnabled()) {
+        log(`AnthropicProvider.processToolCall: Using call_id: ${callId}`);
+      }
+      
+      // Create a copy of the item and ensure it has the right structure
+      const toolCallItem = JSON.parse(JSON.stringify(item));
+      
+      // Ensure the item has both call_id and id properties
+      toolCallItem.call_id = callId;
+      toolCallItem.id = callId;
+      
+      // Ensure type is set correctly
+      if (!toolCallItem.type) {
+        toolCallItem.type = "function_call";
+      }
+      
+      // For Anthropic, we may need to ensure arguments is a string
+      if (toolCallItem.arguments && typeof toolCallItem.arguments !== 'string') {
+        toolCallItem.arguments = JSON.stringify(toolCallItem.arguments);
+      }
+      
+      if (isLoggingEnabled()) {
+        log(`AnthropicProvider.processToolCall: Prepared tool call item: ${JSON.stringify(toolCallItem)}`);
+      }
+      
+      // Handle the function call
+      try {
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider.processToolCall: Calling handleFunctionCall with item`);
+        }
+        
+        const result = await handleFunctionCall(toolCallItem);
+        
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider.processToolCall: handleFunctionCall returned ${result.length} items`);
+        }
+        
+        // Ensure all result items have the correct call_id
+        const finalResults = result.map(outputItem => {
+          if (outputItem.type === "function_call_output") {
+            return {
+              ...outputItem,
+              call_id: callId
+            };
+          }
+          return outputItem;
+        });
+        
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider.processToolCall: Final results: ${JSON.stringify(finalResults)}`);
+        }
+        
+        return finalResults;
+      } catch (callHandlerError) {
+        log(`AnthropicProvider.processToolCall: Error in handleFunctionCall: ${callHandlerError}`);
+        
+        // Return an error output that can be displayed to the user
+        return [{
+          type: "function_call_output",
+          call_id: callId,
+          output: `Error executing tool call: ${callHandlerError.message || String(callHandlerError)}`
+        }];
+      }
+    } catch (error) {
+      log(`AnthropicProvider.processToolCall: Unexpected error: ${error}`);
+      return [{
+        type: "function_call_output",
+        call_id: "error",
+        output: `Error processing tool call: ${error.message || String(error)}`
+      }];
     }
-    
-    return finalResults;
   }
   
   /**
