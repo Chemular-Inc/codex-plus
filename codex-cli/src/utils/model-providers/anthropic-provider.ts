@@ -169,9 +169,12 @@ export class AnthropicProvider implements ModelProvider {
           log(`AnthropicProvider: Starting to process stream events`);
         }
         
-        for await (const event of stream) {
+        // TypeScript fix: assert that stream has Symbol.asyncIterator as in OpenAI implementation
+        const asyncIterable = stream as unknown as AsyncIterable<any>;
+        
+        for await (const event of asyncIterable) {
           if (isLoggingEnabled()) {
-            log(`AnthropicProvider: Raw event: ${JSON.stringify(event)}`);
+            log(`AnthropicProvider: Event received: ${event.type}`);
           }
           
           // Type assertion for specific event types
@@ -194,7 +197,7 @@ export class AnthropicProvider implements ModelProvider {
             }
           } else if (event.type === "message_delta") {
             if (isLoggingEnabled()) {
-              log(`AnthropicProvider: Message delta: ${JSON.stringify(event.delta)}`);
+              log(`AnthropicProvider: Message delta received`);
             }
             
             if (event.delta.stop_reason) {
@@ -209,21 +212,17 @@ export class AnthropicProvider implements ModelProvider {
               
               // Message complete
               if (isLoggingEnabled()) {
-                log(`AnthropicProvider: Stream complete, yielding done event with messageId: ${messageId}`);
+                log(`AnthropicProvider: Stream complete with stop_reason, yielding done event with messageId: ${messageId}`);
               }
               
               yield { 
                 kind: "done", 
-                responseId: messageId
+                responseId: messageId 
               };
             }
           } else if (event.type === "content_block_start") {
             // Cast to any to avoid TypeScript errors
             const contentBlockStart = event as any;
-            
-            if (isLoggingEnabled()) {
-              log(`AnthropicProvider: Content block start: ${JSON.stringify(contentBlockStart)}`);
-            }
             
             if (contentBlockStart.content_block && contentBlockStart.content_block.type === "tool_use") {
               // Tool use started
@@ -241,14 +240,11 @@ export class AnthropicProvider implements ModelProvider {
             // Cast to any to avoid TypeScript errors
             const contentBlockStop = event as any;
             
-            if (isLoggingEnabled()) {
-              log(`AnthropicProvider: Content block stop: ${JSON.stringify(contentBlockStop)}`);
-            }
-            
             if (contentBlockStop.content_block && 
                 contentBlockStop.content_block.type === "tool_use" && 
                 currentToolUse) {
               // Tool use completed, emit tool call
+              // Use the same structure as OpenAI for maximum compatibility
               const toolCall = {
                 type: "function_call",
                 id: currentToolUse.id,
@@ -259,12 +255,15 @@ export class AnthropicProvider implements ModelProvider {
               };
               
               if (isLoggingEnabled()) {
-                log(`AnthropicProvider: Emitting tool call: ${JSON.stringify(toolCall)}`);
+                log(`AnthropicProvider: Emitting tool call with ID: ${currentToolUse.id}`);
               }
               
               yield { kind: "toolCall", call: toolCall };
               currentToolUse = null;
             }
+          } else if (event.type === "content_block_error") {
+            // Handle tool call errors
+            log(`AnthropicProvider: Content block error: ${JSON.stringify(event)}`);
           } else {
             if (isLoggingEnabled()) {
               log(`AnthropicProvider: Unhandled event type: ${event.type}`);
@@ -272,32 +271,33 @@ export class AnthropicProvider implements ModelProvider {
           }
         }
         
-        // If we get here without yielding a "done" event, yield one now
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider: End of stream reached without stop_reason, yielding final done event`);
-          log(`AnthropicProvider: Content accumulated: "${contentBuffer}"`);
-        }
-        
-        // Regardless of whether we've sent a done event or not, always ensure we have content
-        // This addresses a specific issue with Claude 3.7 where the stream might end without proper events
-        if (contentBuffer && contentBuffer.trim().length > 0) {
+        // This is the fallback if there was no message_delta with stop_reason
+        if (!messageId) {
           if (isLoggingEnabled()) {
-            log(`AnthropicProvider: Ensuring final content is sent`);
+            log(`AnthropicProvider: Stream ended without stop_reason`);
           }
           
-          // If we have content but got no "done" event, ensure we yield the content
-          yield { kind: "content", text: contentBuffer };
+          // Regardless of whether we've sent a done event or not, always ensure we have content
+          if (contentBuffer && contentBuffer.trim().length > 0) {
+            if (isLoggingEnabled()) {
+              log(`AnthropicProvider: Content buffer has content, yielding final content`);
+            }
+            
+            // If we have content but got no "done" event, ensure we yield the content
+            yield { kind: "content", text: contentBuffer };
+          }
+          
+          // Always send a done event at the end of the stream to ensure client doesn't hang
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider: Sending fallback done event`);
+          }
+          
+          yield { 
+            kind: "done", 
+            responseId: `anthropic-${Date.now()}`
+          };
         }
-        
-        // Always send a done event at the end of the stream to ensure client doesn't hang
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider: Sending final done event, messageId=${messageId || 'none'}`);
-        }
-        
-        yield { 
-          kind: "done", 
-          responseId: messageId || `anthropic-fallback-${Date.now()}`
-        };
+      }
       } catch (streamError) {
         log(`Error processing Anthropic stream events: ${streamError}`);
         
@@ -346,10 +346,9 @@ export class AnthropicProvider implements ModelProvider {
     try {
       if (isLoggingEnabled()) {
         log(`AnthropicProvider.processToolCall: Processing tool call: ${JSON.stringify(item)}`);
-        log(`AnthropicProvider.processToolCall: Item type: ${(item as any).type}`);
       }
       
-      // Extract the tool call ID
+      // Extract the call ID - critical for matching with function_call_output
       const callId = (item as any).call_id || (item as any).id;
       
       if (!callId) {
@@ -361,10 +360,15 @@ export class AnthropicProvider implements ModelProvider {
         log(`AnthropicProvider.processToolCall: Using call_id: ${callId}`);
       }
       
-      // Create a copy of the item and ensure it has the right structure
-      const toolCallItem = JSON.parse(JSON.stringify(item));
+      // Create a copy of the item as plain object
+      const toolCallItem: Record<string, unknown> = {};
       
-      // Ensure the item has both call_id and id properties
+      // Copy all properties to a plain object
+      Object.entries(item as any).forEach(([key, value]) => {
+        toolCallItem[key] = value;
+      });
+      
+      // Ensure the item has both call_id and id properties for maximum compatibility
       toolCallItem.call_id = callId;
       toolCallItem.id = callId;
       
@@ -378,55 +382,47 @@ export class AnthropicProvider implements ModelProvider {
         toolCallItem.arguments = JSON.stringify(toolCallItem.arguments);
       }
       
+      // Handle the function call
+      const result = await handleFunctionCall(toolCallItem);
+      
       if (isLoggingEnabled()) {
-        log(`AnthropicProvider.processToolCall: Prepared tool call item: ${JSON.stringify(toolCallItem)}`);
+        log(`AnthropicProvider.processToolCall: handleFunctionCall returned ${result.length} items`);
       }
       
-      // Handle the function call
-      try {
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider.processToolCall: Calling handleFunctionCall with item`);
+      // Ensure all result items have the correct call_id for consistency
+      const finalResults = result.map(outputItem => {
+        if (outputItem.type === "function_call_output") {
+          console.error(`Function call output before fix: call_id=${(outputItem as any).call_id}`);
+          
+          const fixedItem = {
+            ...outputItem,
+            call_id: callId
+          };
+          
+          console.error(`Function call output after fix: call_id=${fixedItem.call_id}`);
+          return fixedItem;
         }
-        
-        const result = await handleFunctionCall(toolCallItem);
-        
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider.processToolCall: handleFunctionCall returned ${result.length} items`);
-        }
-        
-        // Ensure all result items have the correct call_id
-        const finalResults = result.map(outputItem => {
-          if (outputItem.type === "function_call_output") {
-            return {
-              ...outputItem,
-              call_id: callId
-            };
-          }
-          return outputItem;
-        });
-        
-        if (isLoggingEnabled()) {
-          log(`AnthropicProvider.processToolCall: Final results: ${JSON.stringify(finalResults)}`);
-        }
-        
-        return finalResults;
-      } catch (callHandlerError) {
-        log(`AnthropicProvider.processToolCall: Error in handleFunctionCall: ${callHandlerError}`);
-        
-        // Return an error output that can be displayed to the user
-        return [{
-          type: "function_call_output",
-          call_id: callId,
-          output: `Error executing tool call: ${callHandlerError.message || String(callHandlerError)}`
-        }];
-      }
+        return outputItem;
+      });
+      
+      return finalResults;
     } catch (error) {
-      log(`AnthropicProvider.processToolCall: Unexpected error: ${error}`);
+      log(`Error processing tool call: ${error}`);
+      console.error(`Error in AnthropicProvider.processToolCall: ${error}`);
+      
+      // Get the call ID for the error response
+      const callId = (item as any).call_id || (item as any).id;
+      
+      if (!callId) {
+        console.error(`WARNING: No call_id found in function call item`);
+      }
+      
+      // Create an error response with the correct call_id
       return [{
         type: "function_call_output",
-        call_id: "error",
-        output: `Error processing tool call: ${error.message || String(error)}`
-      }];
+        call_id: callId || `anthropic-error-${Date.now()}`,
+        output: `Error processing tool call: ${error}`,
+      } as ResponseInputItem];
     }
   }
   
@@ -438,53 +434,36 @@ export class AnthropicProvider implements ModelProvider {
     onItem: (item: ResponseItem) => void,
     onLoading: (loading: boolean) => void
   ): boolean {
+    // Log the error for debugging
+    if (isLoggingEnabled()) {
+      log(`AnthropicProvider.handleProviderError: ${JSON.stringify(error)}`);
+    }
+    
     // Handle Anthropic-specific errors
     if (error && typeof error === 'object') {
-      // Check for API errors
-      if ('status' in error && typeof error.status === 'number') {
-        const errorStatus = error.status;
-        
-        // Rate limiting
-        if (errorStatus === 429) {
-          onItem({
-            id: `error-${Date.now()}`,
-            type: "message",
-            role: "system",
-            content: [
-              {
-                type: "input_text",
-                text: "⚠️  Anthropic API rate limit exceeded. Please try again shortly."
-              }
-            ]
-          });
-          onLoading(false);
-          return true;
-        }
-        
-        // Server errors
-        if (errorStatus >= 500) {
-          onItem({
-            id: `error-${Date.now()}`,
-            type: "message",
-            role: "system",
-            content: [
-              {
-                type: "input_text",
-                text: "⚠️  Anthropic API server error. Please try again later."
-              }
-            ]
-          });
-          onLoading(false);
-          return true;
-        }
-      }
+      // Get the error status code if available
+      const errorStatus = error.status || error.statusCode || (error.response && error.response.status);
       
-      // Network or timeout errors
-      if (
-        'code' in error && 
-        typeof error.code === 'string' && 
-        ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(error.code)
-      ) {
+      // Check for error type - similar naming to OpenAI for consistency
+      const errorType = error.type || error.error_type || (error.error && error.error.type);
+      
+      // Check for error message
+      const errorMessage = error.message || (error.error && error.error.message) || "Unknown error";
+      
+      // Check for rate limits
+      const isRateLimit = 
+        errorStatus === 429 || 
+        errorType === 'rate_limit_exceeded' || 
+        /rate limit|too many requests/i.test(errorMessage);
+      
+      if (isRateLimit) {
+        // Format error details for display
+        const errorDetails = [
+          `Status: ${errorStatus || "unknown"}`,
+          `Type: ${errorType || "rate limit"}`,
+          `Message: ${errorMessage}`
+        ].join(", ");
+        
         onItem({
           id: `error-${Date.now()}`,
           type: "message",
@@ -492,7 +471,72 @@ export class AnthropicProvider implements ModelProvider {
           content: [
             {
               type: "input_text",
-              text: "⚠️  Network error while contacting Anthropic. Please check your connection and try again."
+              text: `⚠️  Anthropic API rate limit exceeded. ${errorDetails}`
+            }
+          ]
+        });
+        onLoading(false);
+        return true;
+      }
+      
+      // Server errors (500 range)
+      const isServerError = errorStatus && errorStatus >= 500;
+      if (isServerError) {
+        onItem({
+          id: `error-${Date.now()}`,
+          type: "message",
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: `⚠️  Anthropic API server error (${errorStatus}). Please try again later.`
+            }
+          ]
+        });
+        onLoading(false);
+        return true;
+      }
+      
+      // Client errors (400 range, excluding rate limits)
+      const isClientError = errorStatus && errorStatus >= 400 && errorStatus < 500 && errorStatus !== 429;
+      if (isClientError) {
+        // Format error details for display
+        const errorDetails = [
+          `Status: ${errorStatus}`,
+          `Type: ${errorType || "client_error"}`,
+          `Message: ${errorMessage}`
+        ].join(", ");
+        
+        onItem({
+          id: `error-${Date.now()}`,
+          type: "message",
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: `⚠️  Anthropic API request error. ${errorDetails}`
+            }
+          ]
+        });
+        onLoading(false);
+        return true;
+      }
+      
+      // Network or timeout errors
+      const isNetworkError = 
+        (error.code && ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(error.code)) ||
+        error.name === 'TimeoutError' ||
+        /timeout|network|connection/i.test(errorMessage);
+        
+      if (isNetworkError) {
+        onItem({
+          id: `error-${Date.now()}`,
+          type: "message",
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: `⚠️  Network error while contacting Anthropic. Please check your connection and try again. Error: ${errorMessage}`
             }
           ]
         });
@@ -501,6 +545,7 @@ export class AnthropicProvider implements ModelProvider {
       }
     }
     
+    // If we couldn't identify the error type, let the agent loop handle it
     return false;
   }
   
