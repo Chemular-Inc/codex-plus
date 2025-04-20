@@ -251,6 +251,14 @@ export class AgentLoop {
   private async handleFunctionCall(
     item: ResponseFunctionToolCall,
   ): Promise<Array<ResponseInputItem>> {
+    // DIAGNOSTIC - Log the incoming item at the beginning
+    console.error(`HANDLE FUNCTION CALL - Raw item: ${JSON.stringify({
+      type: (item as any).type,
+      id: (item as any).id,
+      call_id: (item as any).call_id,
+      function: (item as any).function ? true : false
+    })}`);
+    
     // If the agent has been canceled in the meantime we should not perform any
     // additional work. Returning an empty array ensures that we neither execute
     // the requested tool call nor enqueue any follow‑up input items. This keeps
@@ -290,6 +298,8 @@ export class AgentLoop {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callId: string = (item as any).call_id ?? (item as any).id;
 
+    console.error(`HANDLE FUNCTION CALL - Name: ${name}, CallId: ${callId}`);
+    
     if (isLoggingEnabled()) {
       log(`Using call ID: ${callId} for function call`);
     }
@@ -366,16 +376,31 @@ export class AgentLoop {
       }
     }
 
+    // DIAGNOSTIC - Log the results before modification
+    console.error(`HANDLE FUNCTION CALL - Results before ID fix: ${JSON.stringify(results.map(r => ({
+      type: r.type,
+      call_id: (r as any).call_id
+    })))}`);
+
     // Ensure all output items have the correct call_id
-    return results.map(item => {
+    const finalResults = results.map(item => {
       if (item.type === "function_call_output") {
-        return {
+        const fixedItem = {
           ...item,
           call_id: callId
         };
+        console.error(`HANDLE FUNCTION CALL - Fixed output item: type=${fixedItem.type}, call_id=${fixedItem.call_id}`);
+        return fixedItem;
       }
       return item;
     });
+    
+    console.error(`HANDLE FUNCTION CALL - Final results: ${JSON.stringify(finalResults.map(r => ({
+      type: r.type,
+      call_id: (r as any).call_id
+    })))}`);
+    
+    return finalResults;
   }
 
   public async run(
@@ -838,10 +863,37 @@ export class AgentLoop {
           log(`Warning: Function call without ID!`);
         }
         
-        // Important: Call handleFunctionCall directly to ensure exact matching with
-        // the original implementation that passed all the tests
+        // Try both approaches to see what's happening
+        const useDirect = true;
+        
+        // Log the input to handleFunctionCall for diagnostic purposes
+        console.error(`DIAGNOSTIC - Function call object: ${JSON.stringify({
+          type: normalizedItem.type,
+          id: (normalizedItem as any).id,
+          call_id: (normalizedItem as any).call_id,
+        })}`);
+        
         // eslint-disable-next-line no-await-in-loop
-        const result = await this.handleFunctionCall(normalizedItem as ResponseFunctionToolCall);
+        let result;
+        if (useDirect) {
+          // Use the direct approach
+          result = await this.handleFunctionCall(normalizedItem as ResponseFunctionToolCall);
+        } else {
+          // Use the adapter approach
+          result = await this.modelAdapter.processToolCall(
+            normalizedItem as ResponseItem,
+            this.handleFunctionCall.bind(this)
+          );
+        }
+        
+        // Log the results
+        if (result && result.length > 0) {
+          for (const item of result) {
+            if (item.type === "function_call_output") {
+              console.error(`DIAGNOSTIC - Output item call_id: ${item.call_id}, type: ${item.type}`);
+            }
+          }
+        }
         
         if (isLoggingEnabled()) {
           log(`Function call result: ${result.length} items`);
