@@ -297,7 +297,6 @@ export class AnthropicProvider implements ModelProvider {
             responseId: `anthropic-${Date.now()}`
           };
         }
-      }
       } catch (streamError) {
         log(`Error processing Anthropic stream events: ${streamError}`);
         
