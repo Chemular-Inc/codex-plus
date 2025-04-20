@@ -209,34 +209,41 @@ export class ModelAdapter {
               // Store the tool call for the completed event
               toolCall = delta.call;
               
+              console.error(`\n*** ADAPTER RECEIVED TOOL CALL ***`);
+              console.error(`Raw tool call from provider:`, JSON.stringify(toolCall, null, 2));
+              
               // Make sure the toolCall has a proper ID format 
               if (toolCall) {
                 // OpenAI expects IDs in a specific format
                 const callId = toolCall.call_id || toolCall.id;
                 if (callId) {
-                  if (isLoggingEnabled()) {
-                    log(`Received tool call with ID: ${callId}`);
-                  }
+                  console.error(`Tool call has ID: ${callId}`);
                   
                   // Ensure both id and call_id are set for maximum compatibility
+                  // We want to make sure both of these are EXACTLY the same
                   toolCall.call_id = callId;
                   toolCall.id = callId;
+                  
+                  console.error(`Final tool call with ID: ${toolCall.call_id}`);
                 } else {
-                  log(`Warning: Tool call without ID received: ${JSON.stringify(toolCall)}`);
+                  console.error(`WARNING: Tool call without ID!`);
                 }
               }
+              
+              // Also emit the tool call immediately - this matches the original agent loop behavior
+              yield {
+                type: "response.output_item.done",
+                item: toolCall
+              };
             }
             else if (delta.kind === "done") {
               // Prepare the final output items for the completion event
               const outputItems = [];
               
-              // If we have a tool call, add it first
+              // If we have a tool call, add it to the completion event
               if (toolCall) {
+                console.error(`Including tool call in completion event with ID: ${toolCall.call_id || toolCall.id}`);
                 outputItems.push(toolCall);
-                
-                if (isLoggingEnabled()) {
-                  log(`Including tool call in final output: ${JSON.stringify(toolCall)}`);
-                }
               }
               
               // If we have content, add a message item

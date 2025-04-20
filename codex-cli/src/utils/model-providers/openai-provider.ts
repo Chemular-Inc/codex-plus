@@ -233,50 +233,60 @@ export class OpenAIProvider implements ModelProvider {
     }
     
     try {
-      // Convert item to an object type accepted by the handleFunctionCall method
-      // Use a plain object with same properties to avoid type issues
-      const functionCallItem: Record<string, unknown> = {};
-      
-      // Extract the call ID - OpenAI uses different property names in different contexts
+      // Extract the call ID - CRITICAL for matching with function_call_output
+      // In OpenAI responses API, the ID can be either in call_id (preferred) or id fields
       const callId = (item as any).call_id || (item as any).id;
       
-      if (isLoggingEnabled()) {
-        log(`Processing tool call with ID: ${callId}`);
-      }
+      console.error(`\n\n*** CALL ID CHECK ***`);
+      console.error(`Processing function call:`);
+      console.error(`- Item type: ${item.type}`);
+      console.error(`- Raw call_id: ${(item as any).call_id}`);
+      console.error(`- Raw id: ${(item as any).id}`);
+      console.error(`- Using call ID: ${callId}`);
       
-      // Copy all enumerable properties to plain object
-      Object.entries(item).forEach(([key, value]) => {
-        functionCallItem[key] = value;
-      });
+      // Copy the entire item to a new object to avoid type issues
+      // This ensures we aren't modifying the original item
+      const functionCallItem = JSON.parse(JSON.stringify(item));
       
-      // Make sure call_id is explicitly set in the object
+      // ALWAYS explicitly set both call_id and id fields
+      // OpenAI may be expecting a specific format for the call ID
       functionCallItem.call_id = callId;
       functionCallItem.id = callId;
       
-      // Process function call
+      // Handle the function call
       const result = await handleFunctionCall(functionCallItem);
       
-      // Ensure all results have the correct call_id
-      return result.map(outputItem => {
+      // Final verification that ALL function_call_output items have the EXACT same call_id
+      // This is absolutely critical for OpenAI to match function calls with their outputs
+      const finalResults = result.map(outputItem => {
         if (outputItem.type === "function_call_output") {
-          // Ensure call_id is set correctly
-          return {
+          console.error(`Function call output before fix: call_id=${outputItem.call_id}`);
+          
+          // Always force the exact same call_id from the original function call
+          const fixedItem = {
             ...outputItem,
             call_id: callId
           };
+          
+          console.error(`Function call output after fix: call_id=${fixedItem.call_id}`);
+          return fixedItem;
         }
         return outputItem;
       });
-    } catch (error) {
-      log(`Error processing tool call: ${error}, Item: ${JSON.stringify(item)}`);
       
-      // Extract call_id, ensuring we have a valid ID
+      return finalResults;
+    } catch (error) {
+      log(`Error processing tool call: ${error}`);
+      console.error(`Error in processToolCall: ${error}`);
+      
+      // Get the call ID for the error response
       const callId = (item as any).call_id || (item as any).id;
       
       if (!callId) {
-        log(`Warning: No call_id found in function call item: ${JSON.stringify(item)}`);
+        console.error(`WARNING: No call_id found in function call item`);
       }
       
+      // Create an error response with the correct call_id
       return [{
         type: "function_call_output",
         call_id: callId,

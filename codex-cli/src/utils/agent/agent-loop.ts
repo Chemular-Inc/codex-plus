@@ -9,6 +9,7 @@ import type {
 
 import { log, isLoggingEnabled } from "./log.js";
 import { ModelAdapter } from "../model-providers/model-adapter.js";
+// Keep using the adapter approach
 import { parseToolCallArguments } from "../parsers.js";
 import {
   getSessionId,
@@ -62,6 +63,8 @@ export class AgentLoop {
 
   // Model adapter to handle provider-specific interactions
   private modelAdapter: ModelAdapter;
+  
+  // Keep using the adapter approach
 
   private onItem: (item: ResponseItem) => void;
   private onLoading: (loading: boolean) => void;
@@ -238,6 +241,8 @@ export class AgentLoop {
     
     // Initialize the model adapter
     this.modelAdapter = new ModelAdapter(model, this.sessionId, this.config);
+    
+    // Keep using the adapter approach
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
@@ -529,7 +534,7 @@ export class AgentLoop {
               );
             }
             
-            // Use model adapter to create stream
+                    // Use model adapter to create stream
             // eslint-disable-next-line no-await-in-loop
             stream = await this.modelAdapter.createStream(
               turnInput,
