@@ -177,22 +177,16 @@ export class ModelAdapter {
     
     // Add previous response ID if available and non-empty
     if (previousResponseId && previousResponseId.trim() !== '') {
-      // OpenAI's API requires having a properly formatted previous_response_id or none at all
-      // Make sure it starts with 'resp_' - this is CRITICAL for the chaining to work
-      const formattedPreviousId = 
-        previousResponseId.startsWith('resp_') ? previousResponseId :
-        previousResponseId.startsWith('resp') ? previousResponseId :
-        `resp_${previousResponseId}`;
-        
-      console.error(`Using formatted previous_response_id: ${formattedPreviousId} (original: ${previousResponseId})`);
+      // Pass the previous response ID directly to the provider
+      console.error(`Using previous_response_id: ${previousResponseId}`);
       
       if (isLoggingEnabled()) {
-        log(`Adding previous_response_id to request: ${formattedPreviousId}`);
+        log(`Adding previous_response_id to request: ${previousResponseId}`);
       }
       
       chatRequest.extras = {
         ...chatRequest.extras,
-        previous_response_id: formattedPreviousId
+        previous_response_id: previousResponseId
       };
     } else {
       if (isLoggingEnabled()) {
@@ -294,20 +288,13 @@ export class ModelAdapter {
                 console.error(`Provider supplied response ID: ${responseId}`);
               }
               
-              // OpenAI needs a response ID format starting with 'resp_'
-              // This is CRITICAL for the function call chaining to work correctly
-              const formattedResponseId = 
-                responseId.startsWith('resp_') ? responseId :
-                responseId.startsWith('resp') ? responseId :
-                `resp_${responseId}`;
+              console.error(`Using response ID in completion event: ${responseId}`);
                 
-              console.error(`Using response ID in completion event: ${formattedResponseId} (original: ${responseId})`);
-                
-              // Emit the completion event with properly formatted ID
+              // Emit the completion event with the response ID
               yield {
                 type: "response.completed",
                 response: {
-                  id: formattedResponseId,
+                  id: responseId,
                   status: "completed",
                   output: outputItems
                 }
