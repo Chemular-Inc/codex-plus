@@ -177,15 +177,22 @@ export class ModelAdapter {
     
     // Add previous response ID if available and non-empty
     if (previousResponseId && previousResponseId.trim() !== '') {
-      // OpenAI's API prefers having a properly formatted previous_response_id or none at all
-      // We'll include it in extras for the provider to use appropriately
+      // OpenAI's API requires having a properly formatted previous_response_id or none at all
+      // Make sure it starts with 'resp_' - this is CRITICAL for the chaining to work
+      const formattedPreviousId = 
+        previousResponseId.startsWith('resp_') ? previousResponseId :
+        previousResponseId.startsWith('resp') ? previousResponseId :
+        `resp_${previousResponseId}`;
+        
+      console.error(`Using formatted previous_response_id: ${formattedPreviousId} (original: ${previousResponseId})`);
+      
       if (isLoggingEnabled()) {
-        log(`Adding previous_response_id to request: ${previousResponseId}`);
+        log(`Adding previous_response_id to request: ${formattedPreviousId}`);
       }
       
       chatRequest.extras = {
         ...chatRequest.extras,
-        previous_response_id: previousResponseId
+        previous_response_id: formattedPreviousId
       };
     } else {
       if (isLoggingEnabled()) {
