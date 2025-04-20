@@ -71,46 +71,55 @@ export class AnthropicProvider implements ModelProvider {
       const tools: Array<Anthropic.Tool> = [];
       
       if (request.tools && request.tools.length > 0) {
-        // Convert our generic tools to Anthropic's format
-        for (const tool of request.tools) {
-          if (tool.name === "shell") {
-            // Convert shell tool to Anthropic format
-            tools.push({
-              name: "shell",
-              description: "Runs a shell command, and returns its output.",
-              input_schema: {
-                type: "object",
-                properties: {
-                  command: {
-                    type: "array", 
-                    items: { type: "string" },
-                    description: "The command to execute"
-                  },
-                  workdir: {
-                    type: "string",
-                    description: "The working directory for the command."
-                  },
-                  timeout: {
-                    type: "number",
-                    description: "The maximum time to wait for the command to complete in milliseconds."
-                  }
-                },
-                required: ["command"]
-              }
-            });
-          }
-        }
-        
-        // Add text editor tool if needed
+        // Always add shell tool
         tools.push({
-          name: "str_replace_editor",
-          description: "Edit text files using commands like view, str_replace, create, and insert.",
+          name: "shell",
+          description: "Runs a shell command, and returns its output.",
           input_schema: {
             type: "object",
-            properties: {},
-            additionalProperties: true
+            properties: {
+              command: {
+                type: "array", 
+                items: { type: "string" },
+                description: "The command to execute"
+              },
+              workdir: {
+                type: "string",
+                description: "The working directory for the command."
+              },
+              timeout: {
+                type: "number",
+                description: "The maximum time to wait for the command to complete in milliseconds."
+              }
+            },
+            required: ["command"]
           }
-        } as Anthropic.Tool);
+        });
+        
+        // File editor tool - using a standard function approach for Claude 3.7 compatibility
+        tools.push({
+          name: "file_editor",
+          description: "Edit text files using view, edit, and create operations.",
+          input_schema: {
+            type: "object",
+            properties: {
+              operation: {
+                type: "string",
+                enum: ["view", "edit", "create"],
+                description: "The operation to perform on the file"
+              },
+              path: {
+                type: "string",
+                description: "The absolute path to the file"
+              },
+              content: {
+                type: "string",
+                description: "The content to write (for edit and create operations)"
+              }
+            },
+            required: ["operation", "path"]
+          }
+        });
       }
       
       // Create message parameters for Anthropic API
@@ -131,9 +140,8 @@ export class AnthropicProvider implements ModelProvider {
             log(`AnthropicProvider: Claude 3.7 detected, using modified tool configuration`);
           }
           
-          // For Claude 3.7, ensure we specify tool_choice
+          // For Claude 3.7, we don't use tool_choice as it's not supported in the same way
           params.tools = tools;
-          params.tool_choice = "auto";
         } else {
           params.tools = tools;
         }
@@ -244,13 +252,32 @@ export class AnthropicProvider implements ModelProvider {
                 contentBlockStop.content_block.type === "tool_use" && 
                 currentToolUse) {
               // Tool use completed, emit tool call
+              // Process arguments specially for shell command to ensure compatibility
+              let processedArgs = currentToolUse.input;
+              
+              // Convert the shell command input format for compatibility
+              if (currentToolUse.name === "shell" && processedArgs && processedArgs.command) {
+                // Claude 3.7 may return command as a single string - convert to array if needed
+                if (typeof processedArgs.command === 'string') {
+                  processedArgs = {
+                    ...processedArgs,
+                    command: processedArgs.command.split(' ')
+                  };
+                }
+              }
+              
+              // Convert file_editor to expected str_replace_editor format if needed
+              if (currentToolUse.name === "file_editor") {
+                currentToolUse.name = "str_replace_editor";
+              }
+              
               // Use the same structure as OpenAI for maximum compatibility
               const toolCall = {
                 type: "function_call",
                 id: currentToolUse.id,
                 call_id: currentToolUse.id,
                 name: currentToolUse.name,
-                arguments: JSON.stringify(currentToolUse.input),
+                arguments: JSON.stringify(processedArgs),
                 status: "completed"
               };
               
@@ -379,6 +406,43 @@ export class AnthropicProvider implements ModelProvider {
       // For Anthropic, we may need to ensure arguments is a string
       if (toolCallItem.arguments && typeof toolCallItem.arguments !== 'string') {
         toolCallItem.arguments = JSON.stringify(toolCallItem.arguments);
+      }
+      
+      // Map tool names if needed - file_editor should map to str_replace_editor
+      if (toolCallItem.name === 'file_editor') {
+        toolCallItem.name = 'str_replace_editor';
+        
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider.processToolCall: Mapped file_editor to str_replace_editor`);
+        }
+      }
+      
+      // Handle shell tool arguments format
+      if (toolCallItem.name === 'shell' && toolCallItem.arguments) {
+        try {
+          const argsObj = typeof toolCallItem.arguments === 'string' 
+            ? JSON.parse(toolCallItem.arguments) 
+            : toolCallItem.arguments;
+            
+          // Fix command format if it's a string
+          if (argsObj.command && typeof argsObj.command === 'string') {
+            const fixedArgs = {
+              ...argsObj,
+              command: argsObj.command.split(' ')
+            };
+            
+            toolCallItem.arguments = JSON.stringify(fixedArgs);
+            
+            if (isLoggingEnabled()) {
+              log(`AnthropicProvider.processToolCall: Fixed shell command format from string to array`);
+            }
+          }
+        } catch (e) {
+          // If parsing fails, leave as is
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider.processToolCall: Failed to parse arguments: ${e}`);
+          }
+        }
       }
       
       // Handle the function call
@@ -559,16 +623,8 @@ export class AnthropicProvider implements ModelProvider {
    * Get Anthropic-specific tool definitions
    */
   getToolDefinitions(): Array<ModelTool> {
-    // Get current model being used
-    const modelId = this.defaultModel;
-    const isClaude37 = modelId.includes("claude-3-7") || modelId.includes("claude-3.7");
-    
-    if (isLoggingEnabled()) {
-      log(`AnthropicProvider.getToolDefinitions: Getting tools for model ${modelId}, isClaude37=${isClaude37}`);
-    }
-    
-    // Base tools that work with all Claude versions
-    const baseTools: Array<ModelTool> = [
+    // Common tool definition that works across all Claude models
+    return [
       // Shell tool
       {
         type: "function",
@@ -593,17 +649,9 @@ export class AnthropicProvider implements ModelProvider {
           },
           required: ["command"]
         }
-      }
-    ];
-    
-    // Add Claude 3.7 specific configuration for text editor tool
-    if (isClaude37) {
-      if (isLoggingEnabled()) {
-        log(`AnthropicProvider.getToolDefinitions: Using Claude 3.7 specific tool configuration`);
-      }
-      
-      // Add simplified editor tool for Claude 3.7
-      baseTools.push({
+      },
+      // Standard editor tool that works across all Claude versions
+      {
         type: "function",
         name: "file_editor",
         description: "Edit text files using view, edit, and create operations.",
@@ -626,16 +674,7 @@ export class AnthropicProvider implements ModelProvider {
           },
           required: ["operation", "path"]
         }
-      });
-    } else {
-      // Standard editor tool for other Claude versions
-      baseTools.push({
-        type: "text_editor_20250124",
-        name: "str_replace_editor",
-        description: "Edit text files using commands like view, str_replace, create, and insert."
-      });
-    }
-    
-    return baseTools;
+      }
+    ];
   }
 }
