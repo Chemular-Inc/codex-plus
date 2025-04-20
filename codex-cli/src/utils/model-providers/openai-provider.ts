@@ -87,26 +87,27 @@ export class OpenAIProvider implements ModelProvider {
         options.temperature = this.getModelSpecificTemperature(request.model, request.temperature);
       }
       
-      // Only include previous_response_id as a fallback - prefer using input instead
-      // We'll only use previous_response_id in limited scenarios where we're confident it's valid
-      const hasPreviousResponseId = !!request.extras?.previous_response_id;
-      
-      // If there's no input or the input is empty, we might need the previous_response_id for continuity
-      const needsPreviousResponseId = input.length === 0;
-      
-      if (hasPreviousResponseId && needsPreviousResponseId) {
+      // Handle previous_response_id regardless of input
+      if (request.extras?.previous_response_id) {
         const respId = request.extras?.previous_response_id || '';
         
+        console.error(`PROVIDER received previous_response_id: ${respId}`);
+        
         // OpenAI requires response IDs to start with 'resp'
-        if (respId.startsWith('resp')) {
-          log(`Using previous_response_id: ${respId}`);
+        if (respId.startsWith('resp_')) {
           options.previous_response_id = respId;
+          console.error(`Using previous_response_id: ${respId}`);
+        } else if (respId.startsWith('resp')) {
+          options.previous_response_id = respId;
+          console.error(`Using previous_response_id: ${respId}`);
         } else {
-          log(`Ignoring invalid previous_response_id: ${respId} (must start with 'resp')`);
-          // Don't include invalid IDs
+          console.error(`WARNING: Invalid previous_response_id format: ${respId} (should start with 'resp')`);
+          
+          // Try to create a valid ID by adding a prefix
+          const fixedId = `resp_${respId}`;
+          console.error(`Attempting with fixed ID: ${fixedId}`);
+          options.previous_response_id = fixedId;
         }
-      } else if (hasPreviousResponseId) {
-        log(`Skipping previous_response_id as input is provided, which is preferred`);
       }
       
       // Add input array (even if empty)

@@ -256,11 +256,14 @@ export class ModelAdapter {
                 });
               }
               
-              // Create a properly formatted response ID for OpenAI
-              // OpenAI requires IDs to start with 'resp'
-              const formattedResponseId = responseId.startsWith('resp') 
-                ? responseId 
-                : `resp_${responseId}`;
+              // OpenAI needs a response ID format starting with 'resp_'
+              // This is CRITICAL for the function call chaining to work correctly
+              const formattedResponseId = 
+                responseId.startsWith('resp_') ? responseId :
+                responseId.startsWith('resp') ? responseId :
+                `resp_${responseId}`;
+                
+              console.error(`Using response ID in completion event: ${formattedResponseId} (original: ${responseId})`);
                 
               // Emit the completion event with properly formatted ID
               yield {

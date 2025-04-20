@@ -453,6 +453,12 @@ export class AgentLoop {
       // `MaxListenersExceededWarning` after ten invocations.
 
       let lastResponseId: string = previousResponseId;
+      
+      if (previousResponseId) {
+        console.error(`Starting with previous response ID: ${previousResponseId}`);
+      } else {
+        console.error(`No previous response ID provided`);
+      }
 
       // If there are unresolved function calls from a previously cancelled run
       // we have to emit dummy tool outputs so that the API no longer expects
@@ -602,8 +608,33 @@ export class AgentLoop {
               log(`AgentLoop.run(): response event ${(event as any)['type']}`);
             }
 
-            // Process event using the model adapter
-            if ((event as any)['type'] === "response.output_item.done") {
+            // Direct handling of event.item.type === "function_call" for maximum compatibility
+            // This is critical for making tool calls work correctly with OpenAI
+            const isToolCall = (event as any)['type'] === "response.output_item.done" && 
+                              (event as any)['item'] && 
+                              (event as any)['item']['type'] === "function_call";
+                              
+            if (isToolCall) {
+              console.error("DIRECT PROCESSING of function_call event");
+              
+              // Get the item directly from the event
+              const item = (event as any)['item'];
+              
+              // Extract the call ID - CRITICAL for matching later
+              const callId = item.call_id ?? item.id;
+              console.error(`Function call received with ID: ${callId}`);
+              
+              // Track it for potential abort
+              if (callId) {
+                this.pendingAborts.add(callId);
+                console.error(`Added ${callId} to pendingAborts`);
+              }
+              
+              // Stage the item directly
+              stageItem(item);
+              
+            } else if ((event as any)['type'] === "response.output_item.done") {
+              // Normal handling for non-function_call items
               const processedItem = this.modelAdapter.processStreamEvent(
                 event as Record<string, unknown>,
                 lastResponseId,
@@ -642,6 +673,10 @@ export class AgentLoop {
               }
               if (response?.id) {
                 lastResponseId = response.id;
+                
+                // DIAGNOSTIC - Log the response ID
+                console.error(`RESPONSE ID set to: ${response.id}`);
+                
                 this.onLastResponseId(response.id);
               }
             }
