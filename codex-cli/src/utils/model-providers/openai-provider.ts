@@ -210,18 +210,49 @@ export class OpenAIProvider implements ModelProvider {
       // Use a plain object with same properties to avoid type issues
       const functionCallItem: Record<string, unknown> = {};
       
+      // Extract the call ID - OpenAI uses different property names in different contexts
+      const callId = (item as any).call_id || (item as any).id;
+      
+      if (isLoggingEnabled()) {
+        log(`Processing tool call with ID: ${callId}`);
+      }
+      
       // Copy all enumerable properties to plain object
       Object.entries(item).forEach(([key, value]) => {
         functionCallItem[key] = value;
       });
       
+      // Make sure call_id is explicitly set in the object
+      functionCallItem.call_id = callId;
+      functionCallItem.id = callId;
+      
       // Process function call
-      return await handleFunctionCall(functionCallItem);
+      const result = await handleFunctionCall(functionCallItem);
+      
+      // Ensure all results have the correct call_id
+      return result.map(outputItem => {
+        if (outputItem.type === "function_call_output") {
+          // Ensure call_id is set correctly
+          return {
+            ...outputItem,
+            call_id: callId
+          };
+        }
+        return outputItem;
+      });
     } catch (error) {
-      log(`Error processing tool call: ${error}`);
+      log(`Error processing tool call: ${error}, Item: ${JSON.stringify(item)}`);
+      
+      // Extract call_id, ensuring we have a valid ID
+      const callId = (item as any).call_id || (item as any).id;
+      
+      if (!callId) {
+        log(`Warning: No call_id found in function call item: ${JSON.stringify(item)}`);
+      }
+      
       return [{
         type: "function_call_output",
-        call_id: (item as any).call_id || (item as any).id,
+        call_id: callId,
         output: `Error processing tool call: ${error}`,
       } as ResponseInputItem];
     }

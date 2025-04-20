@@ -200,6 +200,23 @@ export class ModelAdapter {
             else if (delta.kind === "toolCall") {
               // Store the tool call for the completed event
               toolCall = delta.call;
+              
+              // Make sure the toolCall has a proper ID format 
+              if (toolCall) {
+                // OpenAI expects IDs in a specific format
+                const callId = toolCall.call_id || toolCall.id;
+                if (callId) {
+                  if (isLoggingEnabled()) {
+                    log(`Received tool call with ID: ${callId}`);
+                  }
+                  
+                  // Ensure both id and call_id are set for maximum compatibility
+                  toolCall.call_id = callId;
+                  toolCall.id = callId;
+                } else {
+                  log(`Warning: Tool call without ID received: ${JSON.stringify(toolCall)}`);
+                }
+              }
             }
             else if (delta.kind === "done") {
               // Prepare the final output items for the completion event
@@ -208,6 +225,10 @@ export class ModelAdapter {
               // If we have a tool call, add it first
               if (toolCall) {
                 outputItems.push(toolCall);
+                
+                if (isLoggingEnabled()) {
+                  log(`Including tool call in final output: ${JSON.stringify(toolCall)}`);
+                }
               }
               
               // If we have content, add a message item
