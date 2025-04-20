@@ -146,12 +146,22 @@ export class ModelAdapter {
       }
     };
     
-    // Add previous response ID if available
-    if (previousResponseId) {
+    // Add previous response ID if available and non-empty
+    if (previousResponseId && previousResponseId.trim() !== '') {
+      // OpenAI's API prefers having a properly formatted previous_response_id or none at all
+      // We'll include it in extras for the provider to use appropriately
+      if (isLoggingEnabled()) {
+        log(`Adding previous_response_id to request: ${previousResponseId}`);
+      }
+      
       chatRequest.extras = {
         ...chatRequest.extras,
         previous_response_id: previousResponseId
       };
+    } else {
+      if (isLoggingEnabled()) {
+        log('No previous_response_id provided');
+      }
     }
     
     if (isLoggingEnabled()) {

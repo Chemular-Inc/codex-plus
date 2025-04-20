@@ -87,18 +87,26 @@ export class OpenAIProvider implements ModelProvider {
         options.temperature = this.getModelSpecificTemperature(request.model, request.temperature);
       }
       
-      // Add previous_response_id if available and ensure it has the correct format
-      if (request.extras?.previous_response_id) {
-        const respId = request.extras.previous_response_id;
+      // Only include previous_response_id as a fallback - prefer using input instead
+      // We'll only use previous_response_id in limited scenarios where we're confident it's valid
+      const hasPreviousResponseId = !!request.extras?.previous_response_id;
+      
+      // If there's no input or the input is empty, we might need the previous_response_id for continuity
+      const needsPreviousResponseId = input.length === 0;
+      
+      if (hasPreviousResponseId && needsPreviousResponseId) {
+        const respId = request.extras?.previous_response_id || '';
         
         // OpenAI requires response IDs to start with 'resp'
-        // If the ID doesn't start with 'resp', log it but don't include it to avoid API errors
-        if (!respId.startsWith('resp')) {
-          log(`Warning: Received invalid previous_response_id: ${respId}. OpenAI requires IDs starting with 'resp'`);
-          // Don't add the invalid ID to options to avoid API errors
-        } else {
+        if (respId.startsWith('resp')) {
+          log(`Using previous_response_id: ${respId}`);
           options.previous_response_id = respId;
+        } else {
+          log(`Ignoring invalid previous_response_id: ${respId} (must start with 'resp')`);
+          // Don't include invalid IDs
         }
+      } else if (hasPreviousResponseId) {
+        log(`Skipping previous_response_id as input is provided, which is preferred`);
       }
       
       // Add input array (even if empty)
