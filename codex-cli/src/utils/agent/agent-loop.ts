@@ -664,33 +664,61 @@ export class AgentLoop {
                 }
               }
               
-              // Special handling for "requires_action" status - this is for Claude tool calls
+              // Handle "requires_action" status - provider-agnostic pattern
+              // This generic pattern works for any provider that needs an additional request after a tool call
               if (response?.status === "requires_action" && response?.requires_action?.type === "submit_tool_outputs") {
-                console.error(`Detected requires_action status from Claude - processing tool calls immediately`);
-                
                 if (response.requires_action.tool_calls && response.requires_action.tool_calls.length > 0) {
-                  // Process tool calls immediately
+                  // Log the event for debugging
+                  console.error(`Processing requires_action with ${response.requires_action.tool_calls.length} tool calls`);
+                  console.error(`Using response ID: ${response?.id || 'unknown'}`);
+                  
+                  // Process all tool calls and collect their outputs
                   const toolOutputs = [];
                   
                   for (const toolCall of response.requires_action.tool_calls) {
-                    console.error(`Processing Claude tool call: ${JSON.stringify(toolCall)}`);
-                    
                     try {
-                      // Use our existing tool call handler
-                      const callResults = await this.handleFunctionCall(toolCall);
-                      console.error(`Tool call results: ${JSON.stringify(callResults.map(r => ({type: r.type})))}`);
+                      // Log the tool call we're processing
+                      console.error(`Processing tool call: ${toolCall.name || 'unnamed'}, ID: ${toolCall.id || toolCall.call_id || 'unknown'}`);
                       
-                      // Add the results to our turnInput so they'll be included in the next request
-                      toolOutputs.push(...callResults);
+                      // Execute the tool and get results, completely provider-agnostic
+                      const callResults = await this.handleFunctionCall(toolCall);
+                      
+                      // Ensure call_id is properly set on all outputs
+                      const processedResults = callResults.map(result => {
+                        if (result.type === "function_call_output") {
+                          return {
+                            ...result,
+                            call_id: toolCall.id || toolCall.call_id
+                          };
+                        }
+                        return result;
+                      });
+                      
+                      toolOutputs.push(...processedResults);
+                      
+                      console.error(`Tool call processed, got ${processedResults.length} results`);
                     } catch (toolError) {
-                      console.error(`Error processing Claude tool call: ${toolError}`);
+                      console.error(`Error processing tool call: ${toolError}`);
                     }
                   }
                   
-                  // Add tool outputs to turnInput for the next request
+                  // If we have tool outputs, continue the conversation
                   if (toolOutputs.length > 0) {
+                    // Log for debugging 
+                    console.error(`Continuing conversation with ${toolOutputs.length} tool outputs`);
+                    
+                    // Use the tool outputs as the next turn input
                     turnInput = [...toolOutputs];
-                    console.error(`Added ${toolOutputs.length} tool outputs to turnInput`);
+                    
+                    // Save response ID to maintain conversation context - CRITICAL for Claude 3.7
+                    if (response?.id) {
+                      lastResponseId = response.id;
+                      console.error(`Setting lastResponseId to ${response.id} for continuation`);
+                      this.onLastResponseId(response.id);
+                    }
+                    
+                    // Continue the loop to make a new request with the tool results
+                    continue;
                   }
                 }
               }

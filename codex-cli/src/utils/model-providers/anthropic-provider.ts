@@ -61,18 +61,148 @@ export class AnthropicProvider implements ModelProvider {
         });
       }
       
+      // Keep track of previous messages for the conversation history
+      const previousMessages: Array<{role: string, content: any[]}> = [];
+      let lastToolUseId: string | null = null;
+      
+      // First scan to check if we're sending multiple tool results for the same tool
+      for (const msg of request.messages) {
+        if ((msg as any).tool_result === true && (msg as any).call_id) {
+          if (lastToolUseId === (msg as any).call_id) {
+            console.error(`[WARNING] Multiple tool results for the same tool ID: ${(msg as any).call_id} - Claude may get confused`);
+          }
+          lastToolUseId = (msg as any).call_id;
+        }
+      }
+      
       // Convert chat messages to Anthropic format
       for (const msg of request.messages) {
         // Convert to Anthropic's role format
         const role = msg.role === "system" ? "user" : msg.role;
         
-        // Add the message
-        messages.push({
-          role: role as "user" | "assistant",
-          content: [
-            { type: "text", text: msg.content }
-          ]
-        });
+        // Check if this is a duplicate of the previous message (prevent message loops)
+        const isDuplicate = previousMessages.length > 0 && 
+                          previousMessages[previousMessages.length - 1].role === role &&
+                          JSON.stringify(previousMessages[previousMessages.length - 1].content) === 
+                          JSON.stringify([{ type: "text", text: msg.content }]);
+        
+        if (isDuplicate && isClaude37) {
+          console.error(`[DEBUG] Claude 3.7: Skipping duplicate message with role=${role}`);
+          continue;
+        }
+        
+        // Check if this message contains our tool_result flag
+        if ((msg as any).tool_result === true && 
+            (msg as any).call_id && 
+            (msg as any).output) {
+          
+          // This is a tool result that needs special formatting for Claude
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider: Converting tool_result message to Claude format`);
+          }
+          
+          try {
+            // Parse the output - may be JSON with output and metadata fields
+            const outputStr = (msg as any).output;
+            let outputContent = outputStr;
+            
+            // For Claude 3.7, we need very specific formatting based on the tool used
+            if (isClaude37) {
+              console.error(`[DEBUG] Claude 3.7: Processing tool result for call_id=${(msg as any).call_id}`);
+              console.error(`[DEBUG] Claude 3.7: Raw output=${outputStr}`);
+            }
+            
+            // Try to parse as JSON if it's a JSON string
+            if (typeof outputStr === 'string' && outputStr.trim().startsWith('{')) {
+              try {
+                const parsed = JSON.parse(outputStr);
+                
+                // For shell commands, we need to extract command.stdout specifically
+                if (parsed.output && (msg as any).name === 'shell') {
+                  // Extract the exact command output for a shell command
+                  const commandOutput = parsed.output;
+                  
+                  // Format exactly as Claude expects for shell commands 
+                  outputContent = commandOutput;
+                  
+                  if (isClaude37) {
+                    console.error(`[DEBUG] Claude 3.7: Extracted shell command output: ${outputContent.substring(0, 100)}...`);
+                  }
+                } else {
+                  // Use the output field if available, otherwise use the whole thing
+                  outputContent = parsed.output || outputStr;
+                }
+              } catch (e) {
+                // Not valid JSON, use the string as-is
+                if (isClaude37) {
+                  console.error(`[DEBUG] Claude 3.7: Failed to parse JSON: ${e}`);
+                }
+                outputContent = outputStr;
+              }
+            }
+            
+            // Create a message with tool_result content block according to Claude's spec
+            // NOTE: Claude requires this exact format with tool_use_id matching the original tool call
+            const toolResultMessage = {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result", 
+                  tool_use_id: (msg as any).call_id,
+                  content: outputContent,
+                  // According to Anthropic documentation, we need to explicitly flag errors
+                  // This helps Claude understand when a tool call has failed
+                  ...(typeof outputContent === 'string' && 
+                      (outputContent.toLowerCase().includes('error') || 
+                       outputContent.toLowerCase().includes('not found') || 
+                       outputContent.toLowerCase().includes('failed')) 
+                    ? { is_error: true }
+                    : {})
+                }
+              ]
+            };
+            
+            messages.push(toolResultMessage);
+            previousMessages.push(toolResultMessage);
+            
+            // According to Anthropic docs, we should NOT add an extra message after tool results
+            // Claude 3.7's model is designed to continue automatically when provided with proper tool_result format
+            
+            console.error(`[DEBUG] Claude 3.7: Added tool_result message for call_id=${(msg as any).call_id}`);
+            console.error(`[DEBUG] Claude 3.7: Tool result message: ${JSON.stringify(toolResultMessage)}`);
+            // NO additional message after tool_result - this was causing the infinite loop
+          } catch (e) {
+            // If anything goes wrong, fall back to simple format
+            const fallbackMessage = {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: (msg as any).call_id,
+                  content: (msg as any).output
+                }
+              ]
+            };
+            
+            messages.push(fallbackMessage);
+            previousMessages.push(fallbackMessage);
+          }
+        } else {
+          // Regular message, just add it normally
+          const regularMessage = {
+            role: role as "user" | "assistant",
+            content: [
+              { type: "text", text: msg.content }
+            ]
+          };
+          
+          messages.push(regularMessage);
+          previousMessages.push(regularMessage);
+          
+          if (isClaude37) {
+            console.error(`[DEBUG] Claude 3.7: Added regular message with role=${role}`);
+          }
+        }
       }
       
       // Prepare tools if provided
@@ -191,10 +321,20 @@ export class AnthropicProvider implements ModelProvider {
         params.temperature = request.temperature;
       }
       
-      // Add system prompt - customize for Claude 3.7
+      // Add system prompt based on the model
       if (request.model.includes("claude-3-7") || request.model.includes("claude-3.7")) {
-        params.system = "You are Claude 3.7, a helpful AI assistant integrated with a CLI tool. You have access to tools for viewing files and executing commands. When appropriate, use these tools to help the user.";
+        // Claude 3.7-specific system prompt based on Anthropic's documentation guidance
+        params.system = 
+          "You are Claude 3.7, a helpful AI assistant integrated with a CLI tool called Codex. " + 
+          "You have access to tools for viewing files and executing commands. " +
+          "CRITICAL INSTRUCTION: " +
+          "1. When you use a tool and receive results, you MUST incorporate that information and continue the conversation. " +
+          "2. You should NOT send additional tool messages in sequence without processing the previous tool results. " +
+          "3. If you request a tool action, wait for the results and use them to inform your next response. " +
+          "4. Provide complete, helpful responses that incorporate information from tool results. " +
+          "5. Only make additional tool calls when necessary to answer the user's question or complete their request.";
       } else {
+        // Default Claude system prompt
         params.system = "You are Claude, a helpful AI assistant integrated with a CLI tool. You can use tools to help the user.";
       }
       
@@ -204,7 +344,47 @@ export class AnthropicProvider implements ModelProvider {
       
       // Enhanced logging for all Claude 3.7 requests
       if (isClaude37) {
-        console.error(`[DEBUG] Claude 3.7 request params: ${JSON.stringify(params, null, 2)}`);
+        console.error(`[DEBUG] Claude 3.7 request params: ${JSON.stringify({ 
+          model: params.model, 
+          tools: params.tools?.map(t => t.name),
+          tool_choice: params.tool_choice,
+          message_count: messages.length
+        }, null, 2)}`);
+        console.error(`[DEBUG] Claude 3.7 message count: ${messages.length}`);
+        
+        // Log message roles and types to detect patterns
+        const messageInfo = messages.map(m => {
+          const contentTypes = (m.content || []).map((c: any) => c.type).join(',');
+          return `${m.role}:${contentTypes}`;
+        }).join(" → ");
+        console.error(`[DEBUG] Claude 3.7 message flow: ${messageInfo}`);
+        
+        // Check if we have any tool_result messages
+        const toolResultCount = messages.filter(m => 
+          m.content && m.content.some((c: any) => c.type === 'tool_result')
+        ).length;
+        console.error(`[DEBUG] Claude 3.7 tool_result messages: ${toolResultCount}`);
+        
+        // Check for potential loop triggers based on Anthropic's docs
+        if (messages.length >= 4) {
+          // Pattern: tool_use → tool_result → tool_use → tool_result without assistant responses
+          const lastMessages = messages.slice(-4);
+          const toolUseFollowedByResult = lastMessages.some((m, i) => {
+            if (i < lastMessages.length - 1) {
+              const currentIsAssistant = m.role === 'assistant';
+              const nextIsToolResult = lastMessages[i+1].role === 'user' && 
+                lastMessages[i+1].content && 
+                lastMessages[i+1].content.some((c: any) => c.type === 'tool_result');
+              
+              return currentIsAssistant && nextIsToolResult;
+            }
+            return false;
+          });
+          
+          if (toolUseFollowedByResult) {
+            console.error(`[DEBUG] Claude 3.7 WARNING: Tool use followed immediately by another tool use detected!`);
+          }
+        }
       }
       
       // Create the message stream
@@ -214,9 +394,19 @@ export class AnthropicProvider implements ModelProvider {
         console.error(`[DEBUG] Claude 3.7 stream created successfully`);
       }
       
-      // Variables to track the current tool use
-      let currentToolUse: { id: string; name: string; input: any } | null = null;
+      // Variables to track the current state
+      // This maintains the current tool use being constructed from stream events
+      let currentToolUse: { 
+        id: string; 
+        name: string; 
+        input: any;
+        partialJson?: string;
+      } | null = null;
+      
+      // This accumulates text content
       let contentBuffer = "";
+      
+      // This stores the message ID for the response
       let messageId = "";
       
       if (isClaude37) {
@@ -252,19 +442,52 @@ export class AnthropicProvider implements ModelProvider {
           // Type assertion for specific event types
           if (event.type === "content_block_delta") {
             // Cast to avoid TypeScript errors
-            const textDelta = event.delta as any;
-            if (textDelta && textDelta.type === "text_delta" && typeof textDelta.text === "string") {
-              // Content text
-              contentBuffer += textDelta.text;
+            const delta = event.delta as any;
+            
+            if (delta && delta.type === "text_delta" && typeof delta.text === "string") {
+              // Text content
+              contentBuffer += delta.text;
               
               if (isLoggingEnabled()) {
-                log(`AnthropicProvider: Text content: "${textDelta.text}"`);
+                log(`AnthropicProvider: Text content: "${delta.text}"`);
               }
               
-              yield { kind: "content", text: textDelta.text };
+              yield { kind: "content", text: delta.text };
+            } else if (delta && delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+              // Process tool call JSON deltas - Claude sends these incrementally
+              if (currentToolUse && delta.partial_json) {
+                // Initialize partial JSON accumulator if needed
+                if (!currentToolUse.partialJson) {
+                  currentToolUse.partialJson = '';
+                }
+                
+                // Add this fragment to our accumulated JSON
+                currentToolUse.partialJson += delta.partial_json;
+                
+                // Only attempt parsing if we have what looks like complete JSON
+                if (currentToolUse.partialJson.includes("}")) {
+                  try {
+                    // Ensure we have valid JSON structure before parsing
+                    const jsonString = currentToolUse.partialJson.replace(/^{/, '{').replace(/}$/, '}');
+                    const parsedInput = JSON.parse(jsonString);
+                    
+                    // Update the tool input with the parsed data
+                    currentToolUse.input = parsedInput;
+                    
+                    if (isClaude37) {
+                      console.error(`[DEBUG] Claude 3.7 parsed tool input: ${JSON.stringify(parsedInput)}`);
+                    }
+                  } catch (e) {
+                    // Not complete/valid JSON yet - we'll keep accumulating
+                    if (isClaude37 && isLoggingEnabled()) {
+                      log(`AnthropicProvider: JSON still accumulating: ${currentToolUse.partialJson}`);
+                    }
+                  }
+                }
+              }
             } else {
               if (isLoggingEnabled()) {
-                log(`AnthropicProvider: Unhandled content_block_delta: ${JSON.stringify(textDelta)}`);
+                log(`AnthropicProvider: Unhandled content_block_delta: ${JSON.stringify(delta)}`);
               }
             }
           } else if (event.type === "message_delta") {
@@ -287,11 +510,57 @@ export class AnthropicProvider implements ModelProvider {
                 log(`AnthropicProvider: Stream complete with stop_reason=${event.delta.stop_reason}, yielding done event with messageId: ${messageId}`);
               }
               
-              yield { 
-                kind: "done", 
-                responseId: messageId,
-                stopReason: event.delta.stop_reason 
-              };
+              // Handle different stop reasons
+              if (event.delta.stop_reason === "tool_use" && currentToolUse) {
+                // Claude 3.7 stops with "tool_use" when it wants to execute a tool
+                if (isLoggingEnabled()) {
+                  log(`AnthropicProvider: Received tool_use stop_reason with tool: ${currentToolUse.name}`);
+                }
+                
+                // Process arguments for tool compatibility
+                let processedArgs = currentToolUse.input;
+                
+                // Ensure shell commands are in the format expected by our tools
+                if (currentToolUse.name === "shell" && processedArgs && processedArgs.command) {
+                  if (typeof processedArgs.command === 'string') {
+                    processedArgs = {
+                      ...processedArgs,
+                      command: processedArgs.command.split(' ')
+                    };
+                  }
+                }
+                
+                // Create a standardized tool call format for the agent loop
+                const toolCall = {
+                  type: "function_call",
+                  id: currentToolUse.id,
+                  call_id: currentToolUse.id,
+                  name: currentToolUse.name,
+                  arguments: JSON.stringify(processedArgs),
+                  status: "incomplete" // Mark as incomplete since Claude will need a follow-up
+                };
+                
+                // First emit the tool call
+                if (isLoggingEnabled()) {
+                  log(`AnthropicProvider: Emitting toolCall for Claude: ${currentToolUse.name}`);
+                }
+                
+                yield { kind: "toolCall", call: toolCall };
+                
+                // Then emit done with special stop reason so the agent loop knows Claude needs a follow-up
+                yield { 
+                  kind: "done", 
+                  responseId: messageId,
+                  stopReason: "tool_use"  // This special stopReason will be handled in agent-loop
+                };
+              } else {
+                // Standard completion - normal response end
+                yield { 
+                  kind: "done", 
+                  responseId: messageId,
+                  stopReason: event.delta.stop_reason 
+                };
+              }
             }
           } else if (event.type === "content_block_start") {
             // Cast to any to avoid TypeScript errors
@@ -617,18 +886,28 @@ export class AnthropicProvider implements ModelProvider {
         log(`AnthropicProvider.processToolCall: handleFunctionCall returned ${result.length} items`);
       }
       
-      // Ensure all result items have the correct call_id for consistency
+      // For Claude, we need to transform the function_call_output to match Claude's expected format
+      // This follows Claude docs where tool results need to be in a user message with tool_result content
       const finalResults = result.map(outputItem => {
         if (outputItem.type === "function_call_output") {
-          console.error(`Function call output before fix: call_id=${(outputItem as any).call_id}`);
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider.processToolCall: Transforming function_call_output to Claude format`);
+          }
           
-          const fixedItem = {
+          // Create a modified item that Claude will understand
+          const transformedItem = {
             ...outputItem,
-            call_id: callId
+            call_id: callId,     // Ensure call_id is set properly
+            name: toolCallItem.name, // Include the tool name for better processing
+            role: "user",        // Tool results should be in a user message for Claude
+            tool_result: true    // Flag to mark this as special tool result for Claude
           };
           
-          console.error(`Function call output after fix: call_id=${fixedItem.call_id}`);
-          return fixedItem;
+          if (isClaude37) {
+            console.error(`[DEBUG] Claude 3.7: Creating tool result for ${toolCallItem.name} with call_id=${callId}`);
+          }
+          
+          return transformedItem;
         }
         return outputItem;
       });
