@@ -27,6 +27,7 @@ import { createInputItem } from "./utils/input-utils";
 import {
   isModelSupportedForResponses,
   preloadModels,
+  resolveModel
 } from "./utils/model-utils.js";
 import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
@@ -243,8 +244,16 @@ let config = loadConfig(undefined, undefined, {
 });
 
 const prompt = cli.input[0];
-const model = cli.flags.model;
+let model = cli.flags.model;
 const imagePaths = cli.flags.image as Array<string> | undefined;
+
+// Apply model resolution for user-friendly aliases
+if (model) {
+  const resolvedModel = resolveModel(model);
+  if (resolvedModel) {
+    model = resolvedModel.modelId;
+  }
+}
 
 config = {
   apiKey,

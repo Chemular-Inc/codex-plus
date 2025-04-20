@@ -9,7 +9,8 @@ import type { ChatMessage, ChatRequest, ModelProvider } from "./common-types.js"
 import type { AppConfig } from "../config.js";
 import type { ResponseInputItem, ResponseItem } from "openai/resources/responses/responses.mjs";
 
-import { getProviderForModel, resolveModel } from "./provider-registry.js";
+import { getProviderForModel } from "./provider-registry.js";
+import { resolveModel } from "../model-utils.js";
 import { log, isLoggingEnabled } from "../agent/log.js";
 
 
