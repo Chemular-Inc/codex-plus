@@ -112,6 +112,15 @@ export class OpenAIProvider implements ModelProvider {
       // Add input array (even if empty)
       options.input = input;
       
+      // Diagnostic logging for function call outputs
+      for (const item of input) {
+        if (item.type === 'function_call_output') {
+          console.error(`OPENAI PROVIDER - function_call_output in input: call_id=${item.call_id}`);
+        } else if ('function_call' in item) {
+          console.error(`OPENAI PROVIDER - function_call in input`);
+        }
+      }
+      
       if (isLoggingEnabled()) {
         log(`OpenAI request options: ${JSON.stringify(options, null, 2)}`);
       }

@@ -146,6 +146,14 @@ export class ModelAdapter {
       }
     };
     
+    // Log all input messages for diagnostic purposes
+    console.error('INPUT MESSAGES:');
+    for (const msg of messages) {
+      if (msg.type === 'function_call_output') {
+        console.error(`  function_call_output: call_id=${msg.call_id}`);
+      }
+    }
+    
     // Add previous response ID if available and non-empty
     if (previousResponseId && previousResponseId.trim() !== '') {
       // OpenAI's API prefers having a properly formatted previous_response_id or none at all
