@@ -163,12 +163,19 @@ export class AnthropicProvider implements ModelProvider {
         // - {"type": "tool", "name": "TOOL_NAME"}: Forces Claude to use a specific tool
         // - "none": Prevents Claude from using any tools
         
-        // For our case, we'll use "auto" to let Claude decide when to use tools
+        // The error suggests we need to use an object format for tool_choice
         if (isLoggingEnabled()) {
-          log(`AnthropicProvider: Setting tool_choice to "auto" for ${isClaude37 ? 'Claude 3.7' : 'Claude'}`);
+          log(`AnthropicProvider: Setting tool_choice as object for ${isClaude37 ? 'Claude 3.7' : 'Claude'}`);
         }
         
-        params.tool_choice = "auto";
+        // Use object format for tool_choice auto
+        params.tool_choice = { type: "auto" };
+        
+        if (isLoggingEnabled()) {
+          // Log the request for debugging
+          const debugRequestInfo = JSON.stringify(params, null, 2);
+          log(`AnthropicProvider: Full request params: ${debugRequestInfo}`);
+        }
       }
       
       // Add temperature if provided
