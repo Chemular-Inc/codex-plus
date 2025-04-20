@@ -236,16 +236,16 @@ export class ModelAdapter {
               // Make sure the toolCall has a proper ID format 
               if (toolCall) {
                 // OpenAI expects IDs in a specific format
-                const callId = toolCall.call_id || toolCall.id;
+                const callId = (toolCall as Record<string, any>)['call_id'] || (toolCall as Record<string, any>)['id'];
                 if (callId) {
                   console.error(`Tool call has ID: ${callId}`);
                   
                   // Ensure both id and call_id are set for maximum compatibility
                   // We want to make sure both of these are EXACTLY the same
-                  toolCall.call_id = callId;
-                  toolCall.id = callId;
+                  (toolCall as Record<string, any>)['call_id'] = callId;
+                  (toolCall as Record<string, any>)['id'] = callId;
                   
-                  console.error(`Final tool call with ID: ${toolCall.call_id}`);
+                  console.error(`Final tool call with ID: ${(toolCall as Record<string, any>)['call_id']}`);
                 } else {
                   console.error(`WARNING: Tool call without ID!`);
                 }
@@ -263,7 +263,7 @@ export class ModelAdapter {
               
               // If we have a tool call, add it to the completion event
               if (toolCall) {
-                console.error(`Including tool call in completion event with ID: ${toolCall.call_id || toolCall.id}`);
+                console.error(`Including tool call in completion event with ID: ${toolCall['call_id'] || toolCall['id']}`);
                 outputItems.push(toolCall);
               }
               

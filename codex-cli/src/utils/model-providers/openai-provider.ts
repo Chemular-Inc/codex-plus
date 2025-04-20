@@ -66,7 +66,7 @@ export class OpenAIProvider implements ModelProvider {
     try {
       // Convert the input to ResponseInputItems
       // The request.messages are our internal format, but we need to pass ResponseInputItems to the OpenAI API
-      const input = request.extras?.input || [];
+      const input = request.extras && 'input' in request.extras ? request.extras['input'] : [];
       
       // Create options object with only supported parameters per model
       const options: Record<string, any> = {
@@ -79,26 +79,26 @@ export class OpenAIProvider implements ModelProvider {
       
       // Add reasoning parameter only for Opus models
       if (reasoning) {
-        options.reasoning = reasoning;
+        options['reasoning'] = reasoning;
       }
       
       // Add temperature only for non-Opus models that support it
       if (this.modelSupportsTemperature(request.model)) {
-        options.temperature = this.getModelSpecificTemperature(request.model, request.temperature);
+        options['temperature'] = this.getModelSpecificTemperature(request.model, request.temperature);
       }
       
       // Handle previous_response_id regardless of input
-      if (request.extras?.previous_response_id) {
-        const respId = request.extras?.previous_response_id || '';
+      if (request.extras && 'previous_response_id' in request.extras) {
+        const respId = request.extras['previous_response_id'] as string || '';
         
         console.error(`PROVIDER received previous_response_id: ${respId}`);
         
         // OpenAI requires response IDs to start with 'resp'
-        if (respId.startsWith('resp_')) {
-          options.previous_response_id = respId;
+        if (typeof respId === 'string' && respId.startsWith('resp_')) {
+          options['previous_response_id'] = respId;
           console.error(`Using previous_response_id: ${respId}`);
-        } else if (respId.startsWith('resp')) {
-          options.previous_response_id = respId;
+        } else if (typeof respId === 'string' && respId.startsWith('resp')) {
+          options['previous_response_id'] = respId;
           console.error(`Using previous_response_id: ${respId}`);
         } else {
           console.error(`WARNING: Invalid previous_response_id format: ${respId} (should start with 'resp')`);
@@ -106,17 +106,17 @@ export class OpenAIProvider implements ModelProvider {
           // Try to create a valid ID by adding a prefix
           const fixedId = `resp_${respId}`;
           console.error(`Attempting with fixed ID: ${fixedId}`);
-          options.previous_response_id = fixedId;
+          options['previous_response_id'] = fixedId;
         }
       }
       
       // Add input array (even if empty)
-      options.input = input;
+      options['input'] = input;
       
       // Diagnostic logging for function call outputs
-      for (const item of input) {
-        if (item.type === 'function_call_output') {
-          console.error(`OPENAI PROVIDER - function_call_output in input: call_id=${item.call_id}`);
+      for (const item of input as Array<Record<string, any>>) {
+        if (typeof item === 'object' && item && 'type' in item && item['type'] === 'function_call_output') {
+          console.error(`OPENAI PROVIDER - function_call_output in input: call_id=${item['call_id']}`);
         } else if ('function_call' in item) {
           console.error(`OPENAI PROVIDER - function_call in input`);
         }
@@ -128,12 +128,38 @@ export class OpenAIProvider implements ModelProvider {
       
       // Use the responses API which provides more detailed events
       // Use the rate limiter to prevent hitting API limits
-      const stream = await import('../rate-limiter-lite.js').then(({ rateLimited }) => 
-        rateLimited('openai', () => this.oai.responses.create(options))
-      );
+      let stream;
+      try {
+        stream = await import('../rate-limiter-lite.js').then(({ rateLimited }) =>
+          rateLimited('openai', () => this.oai.responses.create(options as any))
+        );
+      } catch (error) {
+        if (
+          error && 
+          typeof error === 'object' &&
+          'response' in error && 
+          error.response && 
+          typeof error.response === 'object' &&
+          'data' in error.response && 
+          error.response.data && 
+          typeof error.response.data === 'object' &&
+          'code' in error.response.data &&
+          error.response.data.code === 'previous_response_not_found'
+        ) {
+          log(`Previous response not found (${error.response.data.code}). Clearing previous_response_id and retrying.`);
+          delete options['previous_response_id'];
+          stream = await import('../rate-limiter-lite.js').then(({ rateLimited }) =>
+            rateLimited('openai', () => this.oai.responses.create(options as any))
+          );
+        } else {
+          throw error;
+        }
+      }
       
       // Process the stream and normalize to our ChatDelta format
-      for await (const event of stream) {
+      // TypeScript fix: assert that stream has Symbol.asyncIterator
+      const asyncIterable = stream as unknown as AsyncIterable<any>;
+      for await (const event of asyncIterable) {
         if (event.type === "response.output_item.done" && event.item) {
           const item = event.item;
           
@@ -165,8 +191,8 @@ export class OpenAIProvider implements ModelProvider {
             
             // Always include BOTH id and call_id properties for maximum compatibility
             // This ensures the agent loop will have a valid ID to use
-            plainObject.id = callId;
-            plainObject.call_id = callId;
+            plainObject['id'] = callId;
+            plainObject['call_id'] = callId;
             
             if (isLoggingEnabled()) {
               log(`Emitting tool call with ID: ${callId}`);
@@ -487,7 +513,7 @@ export class OpenAIProvider implements ModelProvider {
    * Helper method to prepare tool definitions for OpenAI
    * Uses a consistent tool definition that matches the original agent-loop implementation
    */
-  private prepareTools(tools: Array<ModelTool>): Array<any> {
+  private prepareTools(_tools: Array<ModelTool>): Array<any> {
     // We always return the same shell tool definition regardless of input
     // This ensures compatibility with the original agent-loop implementation
     return [{
