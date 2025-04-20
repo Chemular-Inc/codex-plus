@@ -214,7 +214,10 @@ export class ModelAdapter {
           // Track content accumulation for the final response
           let contentAccumulator = "";
           let toolCall: Record<string, unknown> | null = null;
-          const responseId = `${Date.now()}`;
+          
+          // We'll get the actual response ID from the provider's completed event
+          // But have a fallback just in case
+          let responseId = `${Date.now()}`;
           
           // Process deltas from the provider
           for await (const delta of providerStream) {
@@ -282,6 +285,13 @@ export class ModelAdapter {
                   content: [{ type: "output_text", text: contentAccumulator }],
                   id: responseId
                 });
+              }
+              
+              // If the provider gives us a response ID, use it
+              // This is CRITICAL: OpenAI must recognize its own ID
+              if (delta.responseId) {
+                responseId = delta.responseId;
+                console.error(`Provider supplied response ID: ${responseId}`);
               }
               
               // OpenAI needs a response ID format starting with 'resp_'

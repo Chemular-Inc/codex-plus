@@ -36,7 +36,7 @@ export type ToolChoice = "auto" | "none" | { name: string };
 export type ChatDelta = 
   | { kind: "content"; text: string }
   | { kind: "toolCall"; call: Record<string, unknown> } 
-  | { kind: "done" };
+  | { kind: "done"; responseId?: string };
 
 /**
  * Request parameters for chat completions.

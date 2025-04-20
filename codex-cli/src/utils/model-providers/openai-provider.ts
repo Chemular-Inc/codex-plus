@@ -203,7 +203,14 @@ export class OpenAIProvider implements ModelProvider {
         }
         
         if (event.type === "response.completed") {
-          yield { kind: "done" };
+          // Pass along the OpenAI response ID - critical for chaining
+          const responseId = event.response?.id;
+          if (responseId) {
+            console.error(`OpenAI completed response with ID: ${responseId}`);
+            yield { kind: "done", responseId };
+          } else {
+            yield { kind: "done" };
+          }
         }
       }
     } catch (error) {
