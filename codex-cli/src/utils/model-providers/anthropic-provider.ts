@@ -35,8 +35,16 @@ export class AnthropicProvider implements ModelProvider {
    * Stream a chat completion from Anthropic
    */
   async *stream(request: ChatRequest): AsyncIterable<ChatDelta> {
+    // For debugging - always log API requests when using Claude 3.7
+    const isClaude37 = request.model.includes("claude-3-7") || request.model.includes("claude-3.7");
+    
     if (isLoggingEnabled()) {
       log(`AnthropicProvider.stream: Streaming from model ${request.model}`);
+      log(`AnthropicProvider.stream: Claude version check - isClaude37=${isClaude37}`);
+    }
+    
+    if (isClaude37) {
+      console.error(`[DEBUG] Using Claude 3.7: ${request.model}`);
     }
     
     try {
@@ -194,13 +202,26 @@ export class AnthropicProvider implements ModelProvider {
         log(`AnthropicProvider.stream: params = ${JSON.stringify(params, null, 2)}`);
       }
       
+      // Enhanced logging for all Claude 3.7 requests
+      if (isClaude37) {
+        console.error(`[DEBUG] Claude 3.7 request params: ${JSON.stringify(params, null, 2)}`);
+      }
+      
       // Create the message stream
       const stream = await this.anthropic.messages.create(params);
+      
+      if (isClaude37) {
+        console.error(`[DEBUG] Claude 3.7 stream created successfully`);
+      }
       
       // Variables to track the current tool use
       let currentToolUse: { id: string; name: string; input: any } | null = null;
       let contentBuffer = "";
       let messageId = "";
+      
+      if (isClaude37) {
+        console.error(`[DEBUG] Claude 3.7 beginning to process stream events`);
+      }
       
       // Process the stream
       try {
@@ -211,7 +232,19 @@ export class AnthropicProvider implements ModelProvider {
         // TypeScript fix: assert that stream has Symbol.asyncIterator as in OpenAI implementation
         const asyncIterable = stream as unknown as AsyncIterable<any>;
         
+        if (isClaude37) {
+          console.error(`[DEBUG] Claude 3.7 beginning for-await loop`);
+        }
+        
+        let eventCount = 0;
         for await (const event of asyncIterable) {
+          eventCount++;
+          
+          if (isClaude37) {
+            console.error(`[DEBUG] Claude 3.7 event #${eventCount}: ${event.type}`);
+            console.error(`[DEBUG] Claude 3.7 event data: ${JSON.stringify(event, null, 2)}`);
+          }
+          
           if (isLoggingEnabled()) {
             log(`AnthropicProvider: Event received: ${event.type}`);
           }
@@ -360,6 +393,11 @@ export class AnthropicProvider implements ModelProvider {
         
         // This is the fallback if there was no message_delta with stop_reason
         if (!messageId) {
+          if (isClaude37) {
+            console.error(`[DEBUG] Claude 3.7 stream ended with eventCount=${eventCount}, no messageId`);
+            console.error(`[DEBUG] Claude 3.7 contentBuffer="${contentBuffer}"`);
+          }
+          
           if (isLoggingEnabled()) {
             log(`AnthropicProvider: Stream ended without stop_reason`);
           }
@@ -387,17 +425,49 @@ export class AnthropicProvider implements ModelProvider {
       } catch (streamError) {
         log(`Error processing Anthropic stream events: ${streamError}`);
         
+        if (isClaude37) {
+          console.error(`[DEBUG] Claude 3.7 stream processing error: ${streamError}`);
+          console.error(`[DEBUG] Claude 3.7 error details: ${JSON.stringify(streamError, null, 2)}`);
+          console.error(`[DEBUG] Claude 3.7 stack trace: ${(streamError as any)?.stack || 'No stack trace'}`);
+          
+          // For Claude 3.7, yield some content if we have it
+          if (contentBuffer && contentBuffer.trim().length > 0) {
+            console.error(`[DEBUG] Claude 3.7 yielding content buffer on error: "${contentBuffer}"`);
+            yield { kind: "content", text: contentBuffer };
+          } else {
+            console.error(`[DEBUG] Claude 3.7 no content buffer to yield on error`);
+            // Yield minimal content to prevent hanging
+            yield { kind: "content", text: "I encountered an error processing your request." };
+          }
+        }
+        
         // Make sure we yield a done event even on error, so the client doesn't hang
         yield { 
           kind: "done", 
           responseId: `anthropic-error-${Date.now()}`
         };
         
-        throw streamError;
+        // Log but don't rethrow for Claude 3.7 to prevent crashes
+        if (isClaude37) {
+          console.error(`[DEBUG] Claude 3.7 suppressing error throw to prevent crash`);
+        } else {
+          throw streamError;
+        }
       }
     } catch (error) {
       log(`Error streaming from Anthropic: ${error}`);
-      throw error;
+      
+      if (isClaude37) {
+        console.error(`[DEBUG] Claude 3.7 outer error: ${error}`);
+        console.error(`[DEBUG] Claude 3.7 outer error details: ${JSON.stringify(error, null, 2)}`);
+        console.error(`[DEBUG] Claude 3.7 outer stack trace: ${(error as any)?.stack || 'No stack trace'}`);
+        
+        // Yield minimal content to prevent hanging
+        yield { kind: "content", text: "I encountered an error communicating with the Anthropic API." };
+        yield { kind: "done", responseId: `anthropic-outer-error-${Date.now()}` };
+      } else {
+        throw error;
+      }
     }
   }
   
