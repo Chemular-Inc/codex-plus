@@ -677,11 +677,23 @@ export class AgentLoop {
                   
                   for (const toolCall of response.requires_action.tool_calls) {
                     try {
-                      // Log the tool call we're processing
-                      console.error(`Processing tool call: ${toolCall.name || 'unnamed'}, ID: ${toolCall.id || toolCall.call_id || 'unknown'}`);
-                      
-                      // Execute the tool and get results, completely provider-agnostic
-                      const callResults = await this.handleFunctionCall(toolCall);
+                      // Get the tool call ID, critical for properly tracking tool calls
+                    const toolCallId = toolCall.id || toolCall.call_id;
+                    console.error(`Processing tool call: ${toolCall.name || 'unnamed'}, ID: ${toolCallId || 'unknown'}`);
+                    
+                    // Check if we've already processed this exact tool call ID to prevent infinite loops
+                    if (toolCallId && this.alreadyProcessedResponses.has(toolCallId)) {
+                      console.error(`SKIPPING already processed tool call ID: ${toolCallId} to prevent infinite loop`);
+                      continue;
+                    }
+                    
+                    // Mark this tool call as processed to prevent loops
+                    if (toolCallId) {
+                      this.alreadyProcessedResponses.add(toolCallId);
+                    }
+                    
+                    // Execute the tool and get results, completely provider-agnostic
+                    const callResults = await this.handleFunctionCall(toolCall);
                       
                       // Ensure call_id is properly set on all outputs
                       const processedResults = callResults.map(result => {

@@ -287,6 +287,19 @@ export class AnthropicProvider implements ModelProvider {
         stream: true,
       };
       
+      // Handle previous_response_id from request.extras
+      // For Claude, this is carried through the message history itself
+      if (request.extras && request.extras.previous_response_id) {
+        const respId = request.extras.previous_response_id as string;
+        console.error(`[DEBUG] Anthropic received previous_response_id: ${respId}`);
+        
+        if (isClaude37) {
+          console.error(`[DEBUG] Claude 3.7: Using previous response ID: ${respId}`);
+          // We track the message ID in debug logs but don't need a specific parameter
+          // The message history itself maintains continuity in Anthropic's API
+        }
+      }
+      
       // Add tools if available - with correct tool_choice format
       if (tools.length > 0) {
         // Check if this is a Claude 3.7 model
@@ -327,12 +340,13 @@ export class AnthropicProvider implements ModelProvider {
         params.system = 
           "You are Claude 3.7, a helpful AI assistant integrated with a CLI tool called Codex. " + 
           "You have access to tools for viewing files and executing commands. " +
-          "CRITICAL INSTRUCTION: " +
-          "1. When you use a tool and receive results, you MUST incorporate that information and continue the conversation. " +
-          "2. You should NOT send additional tool messages in sequence without processing the previous tool results. " +
-          "3. If you request a tool action, wait for the results and use them to inform your next response. " +
-          "4. Provide complete, helpful responses that incorporate information from tool results. " +
-          "5. Only make additional tool calls when necessary to answer the user's question or complete their request.";
+          "CRITICAL INSTRUCTION FOR TOOL USE: " +
+          "1. When you use a tool and receive results, you MUST incorporate that information and continue the conversation with a detailed response. " +
+          "2. DO NOT make another tool call immediately after receiving tool results - first respond to the user about the results. " +
+          "3. VERY IMPORTANT: If you request a tool action, wait for the results and use them to inform your next response. " +
+          "4. Provide complete, thoughtful responses that incorporate information from tool results. " +
+          "5. Only make additional tool calls when necessary to answer the user's question or complete their request. " +
+          "6. NEVER make the exact same tool call twice in a row - this causes an infinite loop.";
       } else {
         // Default Claude system prompt
         params.system = "You are Claude, a helpful AI assistant integrated with a CLI tool. You can use tools to help the user.";
