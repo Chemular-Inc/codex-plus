@@ -83,7 +83,7 @@ export class ModelAdapter {
   async createStream(
     messages: Array<ResponseInputItem>,
     instructions: string,
-    _previousResponseId: string = ""
+    previousResponseId: string = ""
   ): Promise<AsyncIterable<Record<string, unknown>>> {
     // Initialize the provider if needed
     this.initializeProvider();
@@ -95,8 +95,13 @@ export class ModelAdapter {
     // Convert our ResponseInputItems to ChatMessages
     const chatMessages: Array<ChatMessage> = [];
     
-    // Process messages to extract conversation history
+    // We need to convert ResponseInputItems to the format expected by our provider
+    // First, extract the message-type items for the chat history
     for (const item of messages) {
+      if (isLoggingEnabled()) {
+        log(`Processing message item type: ${item.type}`);
+      }
+      
       if (item.type === "message") {
         let contentText = "";
         if (Array.isArray(item.content)) {
@@ -134,8 +139,20 @@ export class ModelAdapter {
         name: "shell",
         description: "Runs a shell command, and returns its output."
       }],
-      stream: true
+      stream: true,
+      extras: {
+        // Include original messages as input for the OpenAI provider
+        input: messages
+      }
     };
+    
+    // Add previous response ID if available
+    if (previousResponseId) {
+      chatRequest.extras = {
+        ...chatRequest.extras,
+        previous_response_id: previousResponseId
+      };
+    }
     
     if (isLoggingEnabled()) {
       log(`Creating stream with provider: ${this.providerName}, model: ${this.modelId}`);

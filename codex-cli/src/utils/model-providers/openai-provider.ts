@@ -54,7 +54,7 @@ export class OpenAIProvider implements ModelProvider {
     // Prepare tools for OpenAI
     const tools = this.prepareTools(request.tools || []);
     
-    // Prepare reasoning for o1/o2/o3/o4 models
+    // Prepare reasoning for Opus models (o1/o2/o3/o4)
     let reasoning: Reasoning | undefined;
     if (request.model.startsWith("o")) {
       reasoning = { effort: "high" };
@@ -64,17 +64,46 @@ export class OpenAIProvider implements ModelProvider {
     }
     
     try {
-      // Use the responses API which provides more detailed events
-      const stream = await this.oai.responses.create({
+      // Convert the input to ResponseInputItems
+      // The request.messages are our internal format, but we need to pass ResponseInputItems to the OpenAI API
+      const input = request.extras?.input || [];
+      
+      // Create options object with only supported parameters per model
+      const options: Record<string, any> = {
         model: request.model,
         instructions: mergedInstructions,
-        input: [], // This will be populated by the agent loop
         stream: true,
         parallel_tool_calls: false,
-        reasoning,
         tools,
-        temperature: request.temperature ?? 0.7,
-      });
+      };
+      
+      // Add reasoning parameter only for Opus models
+      if (reasoning) {
+        options.reasoning = reasoning;
+      }
+      
+      // Add temperature only for non-Opus models that support it
+      if (this.modelSupportsTemperature(request.model)) {
+        options.temperature = this.getModelSpecificTemperature(request.model, request.temperature);
+      }
+      
+      // Add either previousResponseId or input (or both)
+      if (request.extras?.previous_response_id) {
+        options.previous_response_id = request.extras.previous_response_id;
+      } 
+      
+      // Add input array (even if empty)
+      options.input = input;
+      
+      if (isLoggingEnabled()) {
+        log(`OpenAI request options: ${JSON.stringify(options, null, 2)}`);
+      }
+      
+      // Use the responses API which provides more detailed events
+      // Use the rate limiter to prevent hitting API limits
+      const stream = await import('../rate-limiter-lite.js').then(({ rateLimited }) => 
+        rateLimited('openai', () => this.oai.responses.create(options))
+      );
       
       // Process the stream and normalize to our ChatDelta format
       for await (const event of stream) {
@@ -238,13 +267,26 @@ export class OpenAIProvider implements ModelProvider {
       /rate limit/i.test(errCtx.message ?? "");
       
     if (isRateLimit) {
-      // Handle rate limit error
+      // For now, just surface the error to the user
+      // In the agent-loop.ts, the retry logic is handled with exponential backoff
+      // This could be improved to parse suggested retry times from the error message
       const errorDetails = [
         `Status: ${status || "unknown"}`,
         `Code: ${errCtx.code || "unknown"}`,
         `Type: ${errCtx.type || "unknown"}`,
         `Message: ${errCtx.message || "unknown"}`,
       ].join(", ");
+      
+      // Check if the error message contains a suggested retry time
+      const msg = errCtx?.message ?? "";
+      const retryMatch = /(?:retry|try) again in ([\d.]+)s/i.exec(msg);
+      if (retryMatch && retryMatch[1]) {
+        const suggestedRetrySeconds = parseFloat(retryMatch[1]);
+        if (!Number.isNaN(suggestedRetrySeconds)) {
+          // Log the suggested retry time - the agent loop will handle actual retries
+          log(`Rate limit error with suggested retry time: ${suggestedRetrySeconds}s`);
+        }
+      }
       
       onItem({
         id: `error-${Date.now()}`,
@@ -316,72 +358,77 @@ export class OpenAIProvider implements ModelProvider {
   }
   
   /**
-   * Helper method to prepare tool definitions for OpenAI
+   * Check if a given model supports the temperature parameter
+   * Some models like the Opus line (o1/o2/o3/o4) don't support temperature
    */
-  private prepareTools(tools: Array<ModelTool>): Array<any> {
-    // If no tools were provided, return the default shell tool
-    if (tools.length === 0) {
-      return [{
-        type: "function",
-        name: "shell",
-        description: "Runs a shell command, and returns its output.",
-        strict: false,
-        parameters: {
-          type: "object",
-          properties: {
-            command: { type: "array", items: { type: "string" } },
-            workdir: {
-              type: "string",
-              description: "The working directory for the command.",
-            },
-            timeout: {
-              type: "number",
-              description:
-                "The maximum time to wait for the command to complete in milliseconds.",
-            },
-          },
-          required: ["command"],
-          additionalProperties: false,
-        },
-      }];
+  private modelSupportsTemperature(model: string): boolean {
+    // Opus models don't support temperature
+    if (model.startsWith("o")) {
+      return false;
     }
     
-    // Otherwise, convert the provided tools to OpenAI's format
-    return tools.map(tool => {
-      if (tool.name === "shell") {
-        // Use our predefined shell tool definition
-        return {
-          type: "function",
-          name: "shell",
-          description: "Runs a shell command, and returns its output.",
-          strict: false,
-          parameters: {
-            type: "object",
-            properties: {
-              command: { type: "array", items: { type: "string" } },
-              workdir: {
-                type: "string",
-                description: "The working directory for the command.",
-              },
-              timeout: {
-                type: "number",
-                description:
-                  "The maximum time to wait for the command to complete in milliseconds.",
-              },
-            },
-            required: ["command"],
-            additionalProperties: false,
+    // All other models should support temperature
+    return true;
+  }
+  
+  /**
+   * Get model-specific temperature settings
+   * Different models may benefit from different default temperature settings
+   * 
+   * Note: Some models (like o1/o2/o3/o4) don't support the temperature parameter at all
+   * This method should only be called for models that support temperature
+   */
+  private getModelSpecificTemperature(model: string, requestTemperature?: number): number {
+    // If a specific temperature was requested, use that
+    if (requestTemperature !== undefined) {
+      return requestTemperature;
+    }
+    
+    // Model-specific default temperatures
+    if (model.includes("gpt-4")) {
+      // Use a moderate temperature for GPT-4 family
+      return 0.7;
+    } else if (model.includes("gpt-3.5")) {
+      // Use a slightly higher temperature for GPT-3.5 for more variety
+      return 0.8;
+    }
+    
+    // Default fallback for any other models
+    return 0.7;
+  }
+
+  /**
+   * Helper method to prepare tool definitions for OpenAI
+   * Uses a consistent tool definition that matches the original agent-loop implementation
+   */
+  private prepareTools(tools: Array<ModelTool>): Array<any> {
+    // We always return the same shell tool definition regardless of input
+    // This ensures compatibility with the original agent-loop implementation
+    return [{
+      type: "function",
+      name: "shell",
+      description: "Runs a shell command, and returns its output.",
+      strict: false,
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "array", items: { type: "string" } },
+          workdir: {
+            type: "string",
+            description: "The working directory for the command.",
           },
-        };
-      }
-      
-      // Convert a generic tool to OpenAI's format
-      return {
-        type: "function",
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.parameters || {},
-      };
-    });
+          timeout: {
+            type: "number",
+            description:
+              "The maximum time to wait for the command to complete in milliseconds.",
+          },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    }];
+    
+    // Note: The original implementation only supported the shell tool
+    // If we need to support multiple tools in the future, we can expand this method
   }
 }

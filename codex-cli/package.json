@@ -1,9 +1,9 @@
 {
-  "name": "@openai/codex",
-  "version": "0.1.2504181820",
+  "name": "@j_hanlon/codex-plus",
+  "version": "0.1.2-beta.26",
   "license": "Apache-2.0",
   "bin": {
-    "codex": "bin/codex.js"
+    "codex-plus": "bin/codex.js"
   },
   "type": "module",
   "engines": {
@@ -84,6 +84,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/openai/codex"
+    "url": "https://github.com/Chemular-Inc/codex-plus"
   }
 }
