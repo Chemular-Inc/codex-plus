@@ -663,7 +663,39 @@ export class AgentLoop {
                   stageItem(item as ResponseItem);
                 }
               }
-              if (response?.status === "completed" && response?.output) {
+              
+              // Special handling for "requires_action" status - this is for Claude tool calls
+              if (response?.status === "requires_action" && response?.requires_action?.type === "submit_tool_outputs") {
+                console.error(`Detected requires_action status from Claude - processing tool calls immediately`);
+                
+                if (response.requires_action.tool_calls && response.requires_action.tool_calls.length > 0) {
+                  // Process tool calls immediately
+                  const toolOutputs = [];
+                  
+                  for (const toolCall of response.requires_action.tool_calls) {
+                    console.error(`Processing Claude tool call: ${JSON.stringify(toolCall)}`);
+                    
+                    try {
+                      // Use our existing tool call handler
+                      const callResults = await this.handleFunctionCall(toolCall);
+                      console.error(`Tool call results: ${JSON.stringify(callResults.map(r => ({type: r.type})))}`);
+                      
+                      // Add the results to our turnInput so they'll be included in the next request
+                      toolOutputs.push(...callResults);
+                    } catch (toolError) {
+                      console.error(`Error processing Claude tool call: ${toolError}`);
+                    }
+                  }
+                  
+                  // Add tool outputs to turnInput for the next request
+                  if (toolOutputs.length > 0) {
+                    turnInput = [...toolOutputs];
+                    console.error(`Added ${toolOutputs.length} tool outputs to turnInput`);
+                  }
+                }
+              }
+              else if (response?.status === "completed" && response?.output) {
+                // Normal processing for completed responses
                 // TODO: remove this once we can depend on streaming events
                 const newTurnInput = await this.processEventsWithoutStreaming(
                   response.output,
@@ -671,6 +703,7 @@ export class AgentLoop {
                 );
                 turnInput = newTurnInput;
               }
+              
               if (response?.id) {
                 lastResponseId = response.id;
                 

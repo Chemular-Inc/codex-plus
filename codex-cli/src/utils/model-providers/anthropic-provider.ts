@@ -284,12 +284,13 @@ export class AnthropicProvider implements ModelProvider {
               
               // Message complete
               if (isLoggingEnabled()) {
-                log(`AnthropicProvider: Stream complete with stop_reason, yielding done event with messageId: ${messageId}`);
+                log(`AnthropicProvider: Stream complete with stop_reason=${event.delta.stop_reason}, yielding done event with messageId: ${messageId}`);
               }
               
               yield { 
                 kind: "done", 
-                responseId: messageId 
+                responseId: messageId,
+                stopReason: event.delta.stop_reason 
               };
             }
           } else if (event.type === "content_block_start") {

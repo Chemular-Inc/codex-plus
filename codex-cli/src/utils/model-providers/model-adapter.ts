@@ -290,16 +290,47 @@ export class ModelAdapter {
               }
               
               console.error(`Using response ID in completion event: ${responseId}`);
+              
+              // Special handling for Claude with tool calls
+              // If the stop reason is "tool_use", we need to make sure the agent loop
+              // processes the tool call first, before sending the completion event
+              const isClaudeToolUse = delta.stopReason === "tool_use" && toolCall;
+              
+              if (isClaudeToolUse) {
+                console.error(`Claude stop_reason="tool_use" detected, ensuring tool call is processed first`);
                 
-              // Emit the completion event with the response ID
-              yield {
-                type: "response.completed",
-                response: {
-                  id: responseId,
-                  status: "completed",
-                  output: outputItems
-                }
-              };
+                // For Claude, we need to ensure the agent processes this tool call immediately
+                // We don't want to mark this as "completed" yet since Claude will continue after the tool result
+                yield {
+                  type: "response.output_item.done",
+                  item: toolCall
+                };
+                
+                // The completion event should reflect the current response so far,
+                // but status should be "incomplete" to signal that we expect more after tool execution
+                yield {
+                  type: "response.completed",
+                  response: {
+                    id: responseId,
+                    status: "requires_action",
+                    output: outputItems,
+                    requires_action: {
+                      type: "submit_tool_outputs",
+                      tool_calls: [toolCall]
+                    }
+                  }
+                };
+              } else {
+                // Normal completion for non-tool-use stops
+                yield {
+                  type: "response.completed",
+                  response: {
+                    id: responseId,
+                    status: "completed",
+                    output: outputItems
+                  }
+                };
+              }
             }
           }
         } catch (error) {
