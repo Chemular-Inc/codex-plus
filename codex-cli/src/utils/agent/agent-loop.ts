@@ -838,12 +838,10 @@ export class AgentLoop {
           log(`Warning: Function call without ID!`);
         }
         
-        // Use the model adapter to process tool calls
+        // Important: Call handleFunctionCall directly to ensure exact matching with
+        // the original implementation that passed all the tests
         // eslint-disable-next-line no-await-in-loop
-        const result = await this.modelAdapter.processToolCall(
-          normalizedItem as ResponseItem,
-          this.handleFunctionCall.bind(this)
-        );
+        const result = await this.handleFunctionCall(normalizedItem as ResponseFunctionToolCall);
         
         if (isLoggingEnabled()) {
           log(`Function call result: ${result.length} items`);

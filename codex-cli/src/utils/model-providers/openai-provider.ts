@@ -140,10 +140,28 @@ export class OpenAIProvider implements ModelProvider {
           } else if (item.type === "function_call") {
             // For function calls, yield toolCall deltas - convert to plain object first
             const plainObject: Record<string, unknown> = {};
+            
+            // Extract the call ID - critical for matching with function_call_output
+            const callId = (item as any).call_id || (item as any).id;
+            
+            if (isLoggingEnabled()) {
+              log(`Received function_call with ID: ${callId}`);
+            }
+            
             // Copy all properties to a plain object
             Object.entries(item).forEach(([key, value]) => {
               plainObject[key] = value;
             });
+            
+            // Always include BOTH id and call_id properties for maximum compatibility
+            // This ensures the agent loop will have a valid ID to use
+            plainObject.id = callId;
+            plainObject.call_id = callId;
+            
+            if (isLoggingEnabled()) {
+              log(`Emitting tool call with ID: ${callId}`);
+            }
+            
             yield { kind: "toolCall", call: plainObject };
           }
         }
