@@ -18,10 +18,17 @@ export class AnthropicProvider implements ModelProvider {
   
   private anthropic: Anthropic;
   
-  constructor(apiKey: string, _sessionId: string) {
+  private sessionId: string;
+  
+  constructor(apiKey: string, sessionId: string) {
+    this.sessionId = sessionId;
     this.anthropic = new Anthropic({
       apiKey: apiKey || ANTHROPIC_API_KEY || "",
     });
+    
+    if (isLoggingEnabled()) {
+      log(`AnthropicProvider: Initialized with sessionId=${sessionId}`);
+    }
   }
   
   /**
@@ -114,9 +121,22 @@ export class AnthropicProvider implements ModelProvider {
         stream: true,
       };
       
-      // Add tools if available
+      // Add tools if available - but handle Claude 3.7 differently
       if (tools.length > 0) {
-        params.tools = tools;
+        // Check if this is a Claude 3.7 model - they have unique tool handling requirements
+        const isClaude37 = request.model.includes("claude-3-7") || request.model.includes("claude-3.7");
+        
+        if (isClaude37) {
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider: Claude 3.7 detected, using modified tool configuration`);
+          }
+          
+          // For Claude 3.7, ensure we specify tool_choice
+          params.tools = tools;
+          params.tool_choice = "auto";
+        } else {
+          params.tools = tools;
+        }
       }
       
       // Add temperature if provided
@@ -124,8 +144,12 @@ export class AnthropicProvider implements ModelProvider {
         params.temperature = request.temperature;
       }
       
-      // Add system prompt
-      params.system = "You are Claude, a helpful AI assistant integrated with a CLI tool. You can use tools to help the user.";
+      // Add system prompt - customize for Claude 3.7
+      if (request.model.includes("claude-3-7") || request.model.includes("claude-3.7")) {
+        params.system = "You are Claude 3.7, a helpful AI assistant integrated with a CLI tool. You have access to tools for viewing files and executing commands. When appropriate, use these tools to help the user.";
+      } else {
+        params.system = "You are Claude, a helpful AI assistant integrated with a CLI tool. You can use tools to help the user.";
+      }
       
       if (isLoggingEnabled()) {
         log(`AnthropicProvider.stream: params = ${JSON.stringify(params, null, 2)}`);
@@ -251,15 +275,29 @@ export class AnthropicProvider implements ModelProvider {
         // If we get here without yielding a "done" event, yield one now
         if (isLoggingEnabled()) {
           log(`AnthropicProvider: End of stream reached without stop_reason, yielding final done event`);
+          log(`AnthropicProvider: Content accumulated: "${contentBuffer}"`);
         }
         
-        // Only yield a done event if we haven't done so already (which would be indicated by messageId being set)
-        if (!messageId) {
-          yield { 
-            kind: "done", 
-            responseId: `anthropic-fallback-${Date.now()}`
-          };
+        // Regardless of whether we've sent a done event or not, always ensure we have content
+        // This addresses a specific issue with Claude 3.7 where the stream might end without proper events
+        if (contentBuffer && contentBuffer.trim().length > 0) {
+          if (isLoggingEnabled()) {
+            log(`AnthropicProvider: Ensuring final content is sent`);
+          }
+          
+          // If we have content but got no "done" event, ensure we yield the content
+          yield { kind: "content", text: contentBuffer };
         }
+        
+        // Always send a done event at the end of the stream to ensure client doesn't hang
+        if (isLoggingEnabled()) {
+          log(`AnthropicProvider: Sending final done event, messageId=${messageId || 'none'}`);
+        }
+        
+        yield { 
+          kind: "done", 
+          responseId: messageId || `anthropic-fallback-${Date.now()}`
+        };
       } catch (streamError) {
         log(`Error processing Anthropic stream events: ${streamError}`);
         
@@ -477,7 +515,16 @@ export class AnthropicProvider implements ModelProvider {
    * Get Anthropic-specific tool definitions
    */
   getToolDefinitions(): Array<ModelTool> {
-    return [
+    // Get current model being used
+    const modelId = this.defaultModel;
+    const isClaude37 = modelId.includes("claude-3-7") || modelId.includes("claude-3.7");
+    
+    if (isLoggingEnabled()) {
+      log(`AnthropicProvider.getToolDefinitions: Getting tools for model ${modelId}, isClaude37=${isClaude37}`);
+    }
+    
+    // Base tools that work with all Claude versions
+    const baseTools: Array<ModelTool> = [
       // Shell tool
       {
         type: "function",
@@ -502,13 +549,49 @@ export class AnthropicProvider implements ModelProvider {
           },
           required: ["command"]
         }
-      },
-      // Text editor tool - Anthropic specific
-      {
+      }
+    ];
+    
+    // Add Claude 3.7 specific configuration for text editor tool
+    if (isClaude37) {
+      if (isLoggingEnabled()) {
+        log(`AnthropicProvider.getToolDefinitions: Using Claude 3.7 specific tool configuration`);
+      }
+      
+      // Add simplified editor tool for Claude 3.7
+      baseTools.push({
+        type: "function",
+        name: "file_editor",
+        description: "Edit text files using view, edit, and create operations.",
+        parameters: {
+          type: "object",
+          properties: {
+            operation: {
+              type: "string",
+              enum: ["view", "edit", "create"],
+              description: "The operation to perform on the file"
+            },
+            path: {
+              type: "string",
+              description: "The absolute path to the file"
+            },
+            content: {
+              type: "string",
+              description: "The content to write (for edit and create operations)"
+            }
+          },
+          required: ["operation", "path"]
+        }
+      });
+    } else {
+      // Standard editor tool for other Claude versions
+      baseTools.push({
         type: "text_editor_20250124",
         name: "str_replace_editor",
         description: "Edit text files using commands like view, str_replace, create, and insert."
-      }
-    ];
+      });
+    }
+    
+    return baseTools;
   }
 }
