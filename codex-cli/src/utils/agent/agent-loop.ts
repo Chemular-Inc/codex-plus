@@ -31,7 +31,8 @@ export type CommandConfirmation = {
   explanation?: string;
 };
 
-const alreadyProcessedResponses = new Set();
+// This was a global, which could cause issues with multiple instances
+// Each agent loop instance should track its own processed responses
 
 type AgentLoopParams = {
   model: string;
@@ -76,6 +77,8 @@ export class AgentLoop {
    * to interrupt the current task (e.g. via the escape hot‑key).
    */
   private currentStream: unknown | null = null;
+  /** Track responses that have already been processed to avoid duplicates */
+  private alreadyProcessedResponses = new Set<string>();
   /** Incremented with every call to `run()`. Allows us to ignore stray events
    * from streams that belong to a previous run which might still be emitting
    * after the user has canceled and issued a new command. */
@@ -843,7 +846,7 @@ export class AgentLoop {
         // Extract the call ID - OpenAI items may have different ID field names
         const callId: string = (item as any).call_id ?? (item as any).id;
         
-        if (callId && alreadyProcessedResponses.has(callId)) {
+        if (callId && this.alreadyProcessedResponses.has(callId)) {
           if (isLoggingEnabled()) {
             log(`Skipping already processed function call: ${callId}`);
           }
@@ -901,7 +904,7 @@ export class AgentLoop {
         
         // Save ID to processed set if it exists
         if (callId) {
-          alreadyProcessedResponses.add(callId);
+          this.alreadyProcessedResponses.add(callId);
         }
         
         // Make sure all results have the call_id set correctly
