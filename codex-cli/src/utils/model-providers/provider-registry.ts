@@ -5,6 +5,7 @@
 import type { ModelProvider } from "./common-types.js";
 
 import { OpenAIProvider } from "./openai-provider.js";
+import { AnthropicProvider } from "./anthropic-provider.js";
 import { log, isLoggingEnabled } from "../agent/log.js";
 
 // Define model resolution interface
@@ -33,6 +34,16 @@ const modelAliases: Record<string, ResolvedModel> = {
   "o3": { provider: "openai", modelId: "o3", displayName: "o3" },
   "o4": { provider: "openai", modelId: "o4", displayName: "o4" },
   "o4-mini": { provider: "openai", modelId: "o4-mini", displayName: "o4-mini" },
+  
+  // Anthropic models
+  "claude-3-5-sonnet": { provider: "anthropic", modelId: "claude-3-5-sonnet-20240620", displayName: "Claude 3.5 Sonnet" },
+  "claude-3-5-haiku": { provider: "anthropic", modelId: "claude-3-5-haiku-20240307", displayName: "Claude 3.5 Haiku" },
+  "claude-3-opus": { provider: "anthropic", modelId: "claude-3-opus-20240229", displayName: "Claude 3 Opus" },
+  "claude-3-sonnet": { provider: "anthropic", modelId: "claude-3-sonnet-20240229", displayName: "Claude 3 Sonnet" },
+  "claude-3-haiku": { provider: "anthropic", modelId: "claude-3-haiku-20240307", displayName: "Claude 3 Haiku" },
+  
+  // Claude shortcuts
+  "claude": { provider: "anthropic", modelId: "claude-3-5-sonnet-20240620", displayName: "Claude 3.5 Sonnet" },
 };
 
 /**
@@ -46,6 +57,9 @@ export function initializeProvider(providerName: string, apiKey: string, session
   switch (providerName) {
     case "openai":
       providers[providerName] = new OpenAIProvider(apiKey, sessionId);
+      break;
+    case "anthropic":
+      providers[providerName] = new AnthropicProvider(apiKey, sessionId);
       break;
     default:
       throw new Error(`Unsupported provider: ${providerName}`);
@@ -74,9 +88,18 @@ export function resolveModel(modelName: string): ResolvedModel | null {
   }
   
   // If the model name matches a specific pattern we can infer the provider
-  if (modelName.startsWith("gpt-")) {
+  if (modelName.startsWith("gpt-") || modelName.startsWith("o")) {
     return {
       provider: "openai",
+      modelId: modelName,
+      displayName: modelName
+    };
+  }
+  
+  // Handle Claude models
+  if (modelName.startsWith("claude-")) {
+    return {
+      provider: "anthropic",
       modelId: modelName,
       displayName: modelName
     };

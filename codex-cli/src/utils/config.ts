@@ -31,13 +31,24 @@ export const CONFIG_YML_FILEPATH = join(CONFIG_DIR, "config.yml");
 export const CONFIG_FILEPATH = CONFIG_JSON_FILEPATH;
 export const INSTRUCTIONS_FILEPATH = join(CONFIG_DIR, "instructions.md");
 
+// OpenAI configuration
 export const OPENAI_TIMEOUT_MS =
   parseInt(process.env["OPENAI_TIMEOUT_MS"] || "0", 10) || undefined;
 export const OPENAI_BASE_URL = process.env["OPENAI_BASE_URL"] || "";
 export let OPENAI_API_KEY = process.env["OPENAI_API_KEY"] || "";
 
-export function setApiKey(apiKey: string): void {
-  OPENAI_API_KEY = apiKey;
+// Anthropic configuration
+export const ANTHROPIC_TIMEOUT_MS =
+  parseInt(process.env["ANTHROPIC_TIMEOUT_MS"] || "0", 10) || undefined;
+export const ANTHROPIC_BASE_URL = process.env["ANTHROPIC_BASE_URL"] || "";
+export let ANTHROPIC_API_KEY = process.env["ANTHROPIC_API_KEY"] || "";
+
+export function setApiKey(apiKey: string, provider: string = "openai"): void {
+  if (provider === "anthropic") {
+    ANTHROPIC_API_KEY = apiKey;
+  } else {
+    OPENAI_API_KEY = apiKey;
+  }
 }
 
 // Formatting (quiet mode-only).
@@ -55,6 +66,11 @@ export type StoredConfig = {
     maxSize?: number;
     saveHistory?: boolean;
     sensitivePatterns?: Array<string>;
+  };
+  /** API keys for different providers */
+  apiKeys?: {
+    openai?: string;
+    anthropic?: string;
   };
 };
 
