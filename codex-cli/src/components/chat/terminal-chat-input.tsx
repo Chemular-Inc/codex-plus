@@ -507,10 +507,12 @@ function TerminalChatInputThinking({
   const [tokenCount, setTokenCount] = useState(0);
   const [dots, setDots] = useState("");
 
-  // Update token count periodically
+  // Update token count periodically and add debug logging
   useInterval(() => {
     if (active) {
-      setTokenCount(getCurrentTokenCount());
+      const newTokenCount = getCurrentTokenCount();
+      console.log(`TOKEN FETCH: current token count = ${newTokenCount}`);
+      setTokenCount(newTokenCount);
     }
   }, 1000);
 
@@ -636,19 +638,24 @@ function TerminalChatInputThinking({
   // Current ball frame
   const ballFrame = ballFrames[frame];
   
-  // Compact info section with subtle color coding for tokens
-  const tokenCountDisplay = tokenCount > 0 
-    ? <Text color={tokenColor}> • {formattedTokenCount} tokens</Text> 
-    : '';
+  // Keep the elapsed‑seconds text fixed while the ball animation moves.
+  const frameWithSeconds = `${ballFrame} ${thinkingSeconds}s`;
+  
+  // Add token count if available
+  const tokenInfo = tokenCount > 0 ? ` [${tokenCount.toLocaleString()} tokens]` : '';
+  
+  // Debug info to console
+  if (active) {
+    console.log(`THINKING DISPLAY: token count = ${tokenCount}`);
+  }
   
   return (
     <Box flexDirection="column" gap={1}>
-      <Box>
+      <Box gap={2}>
+        <Text>{frameWithSeconds}</Text>
         <Text>
-          <Text>{ballFrame} </Text>
-          <Text bold>Thinking{dots}</Text>
-          <Text dimColor> • {thinkingSeconds}s</Text>
-          {tokenCountDisplay}
+          Thinking{dots}
+          {tokenCount > 0 && <Text color={tokenColor}>{tokenInfo}</Text>}
         </Text>
       </Box>
       

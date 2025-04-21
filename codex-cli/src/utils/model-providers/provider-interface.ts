@@ -180,7 +180,11 @@ export function trackProviderTokenUsage(
     // Update our simple global counter
     currentConversationTokens += totalTokens;
     
-    // Log token usage if debug mode enabled
+    // ALWAYS log token usage to help debug
+    console.log(`TOKEN TRACKING: ${provider} provider sent ${inputTokens} input + ${outputTokens} output = ${totalTokens} tokens`);
+    console.log(`TOKEN TRACKING: Conversation total is now ${currentConversationTokens} tokens`);
+    
+    // Also log through normal logging channel
     if (isLoggingEnabled()) {
       log(`Provider token usage (${provider}): input=${inputTokens}, output=${outputTokens}, total=${totalTokens}, conversation total=${currentConversationTokens}`);
     }
