@@ -10,7 +10,6 @@ import { log, isLoggingEnabled } from "../../utils/agent/log.js";
 import { loadConfig } from "../../utils/config.js";
 import { createInputItem } from "../../utils/input-utils.js";
 import { setSessionId } from "../../utils/session.js";
-import { getCurrentTokenCount } from "../../utils/model-providers/provider-interface.js";
 import {
   loadCommandHistory,
   addToHistory,
@@ -504,17 +503,7 @@ function TerminalChatInputThinking({
   thinkingSeconds: number;
 }) {
   const [awaitingConfirm, setAwaitingConfirm] = useState(false);
-  const [tokenCount, setTokenCount] = useState(0);
   const [dots, setDots] = useState("");
-
-  // Update token count periodically and add debug logging
-  useInterval(() => {
-    if (active) {
-      const newTokenCount = getCurrentTokenCount();
-      console.log(`TOKEN FETCH: current token count = ${newTokenCount}`);
-      setTokenCount(newTokenCount);
-    }
-  }, 1000);
 
   // Animate ellipsis
   useInterval(() => {
@@ -641,21 +630,12 @@ function TerminalChatInputThinking({
   // Keep the elapsed‑seconds text fixed while the ball animation moves.
   const frameWithSeconds = `${ballFrame} ${thinkingSeconds}s`;
   
-  // Add token count if available
-  const tokenInfo = tokenCount > 0 ? ` [${tokenCount.toLocaleString()} tokens]` : '';
-  
-  // Debug info to console
-  if (active) {
-    console.log(`THINKING DISPLAY: token count = ${tokenCount}`);
-  }
-  
   return (
     <Box flexDirection="column" gap={1}>
       <Box gap={2}>
         <Text>{frameWithSeconds}</Text>
         <Text>
           Thinking{dots}
-          {tokenCount > 0 && <Text color={tokenColor}>{tokenInfo}</Text>}
         </Text>
       </Box>
       

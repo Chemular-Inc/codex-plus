@@ -438,21 +438,6 @@ export class AgentLoop {
         throw new Error("AgentLoop has been terminated");
       }
       
-      // Reset token count for new conversation
-      try {
-        // Import resetTokenCount dynamically to avoid circular dependencies
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { resetTokenCount } = require("../model-providers/provider-interface.js");
-        resetTokenCount();
-        if (isLoggingEnabled()) {
-          log("Token count reset for new conversation");
-        }
-      } catch (e) {
-        if (isLoggingEnabled()) {
-          log(`Error resetting token count: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      
       // Record when we start "thinking" so we can report accurate elapsed time.
       const thinkingStart = Date.now();
       // Bump generation so that any late events from previous runs can be

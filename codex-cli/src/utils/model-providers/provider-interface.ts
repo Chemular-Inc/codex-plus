@@ -142,27 +142,8 @@ export class ProviderRegistry {
 // Export a singleton instance of the registry
 export const providerRegistry = ProviderRegistry.getInstance();
 
-// Simple global token counter for the current conversation
-let currentConversationTokens = 0;
-
 /**
- * Get the current conversation token count
- * @returns The total tokens used in the current conversation
- */
-export function getCurrentTokenCount(): number {
-  return currentConversationTokens;
-}
-
-/**
- * Reset the current conversation token count
- * This should be called when starting a new conversation
- */
-export function resetTokenCount(): void {
-  currentConversationTokens = 0;
-}
-
-/**
- * Track token usage from any provider in both the rate limiter and our simple counter
+ * Track token usage from any provider in the rate limiter
  * This function should be used by all providers when token usage data is available
  * 
  * @param provider The provider name (e.g., "openai", "anthropic")
@@ -177,16 +158,9 @@ export function trackProviderTokenUsage(
   try {
     const totalTokens = inputTokens + outputTokens;
     
-    // Update our simple global counter
-    currentConversationTokens += totalTokens;
-    
-    // ALWAYS log token usage to help debug
-    console.log(`TOKEN TRACKING: ${provider} provider sent ${inputTokens} input + ${outputTokens} output = ${totalTokens} tokens`);
-    console.log(`TOKEN TRACKING: Conversation total is now ${currentConversationTokens} tokens`);
-    
-    // Also log through normal logging channel
+    // Log token usage if debug mode enabled
     if (isLoggingEnabled()) {
-      log(`Provider token usage (${provider}): input=${inputTokens}, output=${outputTokens}, total=${totalTokens}, conversation total=${currentConversationTokens}`);
+      log(`Provider token usage (${provider}): input=${inputTokens}, output=${outputTokens}, total=${totalTokens}`);
     }
     
     // Update the rate limiter with this usage
