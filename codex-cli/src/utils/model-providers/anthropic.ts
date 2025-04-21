@@ -223,6 +223,90 @@ function convertAnthropicToOpenAIResponse(
             }
           }
         }
+        // For code_edit tool calls, convert to apply_patch format for agent compatibility
+        else if (contentBlock.name === "code_edit" && contentBlock.input && typeof contentBlock.input === "object") {
+          try {
+            const input = contentBlock.input as {
+              file_path: string;
+              operation: "insert" | "replace" | "delete";
+              position: { start_line: number; end_line?: number };
+              content?: string;
+            };
+            
+            if (isLoggingEnabled()) {
+              log(`Converting code_edit tool call to apply_patch: ${JSON.stringify(input)}`);
+            }
+            
+            // Create patch format based on operation type
+            let patchContent = "";
+            
+            // Format file path for the patch
+            patchContent += `*** Begin Patch\n*** Update File: ${input.file_path}\n`;
+            
+            switch (input.operation) {
+              case "insert":
+                if (!input.content) throw new Error("Missing content for insert operation");
+                
+                // Insert operation: add at position.start_line
+                patchContent += `@@ Line ${input.position.start_line}\n`;
+                patchContent += `+ ${input.content.trim().split("\n").join("\n+ ")}\n`;
+                break;
+                
+              case "replace":
+                if (!input.content) throw new Error("Missing content for replace operation");
+                if (!input.position.end_line) throw new Error("Missing end_line for replace operation");
+                
+                // Replace operation: remove start_line to end_line, then add content
+                patchContent += `@@ Line ${input.position.start_line} - ${input.position.end_line}\n`;
+                
+                // Add lines to be removed with - prefix
+                for (let i = input.position.start_line; i <= input.position.end_line; i++) {
+                  patchContent += `- [Original line ${i}]\n`;
+                }
+                
+                // Add lines to be inserted with + prefix
+                patchContent += `+ ${input.content.trim().split("\n").join("\n+ ")}\n`;
+                break;
+                
+              case "delete":
+                if (!input.position.end_line) throw new Error("Missing end_line for delete operation");
+                
+                // Delete operation: just remove lines without adding any
+                patchContent += `@@ Line ${input.position.start_line} - ${input.position.end_line}\n`;
+                
+                // Add lines to be removed with - prefix
+                for (let i = input.position.start_line; i <= input.position.end_line; i++) {
+                  patchContent += `- [Original line ${i}]\n`;
+                }
+                break;
+                
+              default:
+                throw new Error(`Unsupported operation: ${input.operation}`);
+            }
+            
+            patchContent += "*** End Patch";
+            
+            // Replace the function call with apply_patch
+            functionCallItem.name = "apply_patch";
+            functionCallItem.arguments = JSON.stringify({
+              cmd: ["apply_patch", patchContent]
+            });
+            
+            if (isLoggingEnabled()) {
+              log(`Converted code_edit to apply_patch: ${functionCallItem.arguments}`);
+            }
+          } catch (error) {
+            if (isLoggingEnabled()) {
+              log(`Error converting code_edit to apply_patch: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            
+            // If conversion fails, return an error message
+            functionCallItem.name = "shell";
+            functionCallItem.arguments = JSON.stringify({
+              command: ["echo", `Failed to process code_edit request: ${error instanceof Error ? error.message : String(error)}`]
+            });
+          }
+        }
         
         items.push(functionCallItem);
       }
@@ -384,8 +468,18 @@ class AnthropicClient {
             // When tools are provided, set tool_choice to auto by default
             requestBody.tool_choice = { type: "auto" };
           } else {
-            // Define the shell tool by default
-            requestBody.tools = [this.getShellTool()];
+            // Define our default tools - shell and code_edit for Claude 3.7
+            const tools = [this.getShellTool()];
+            
+            // Add code_edit tool for Claude 3.7 models
+            if (normalizedModel.includes('claude-3-7')) {
+              if (isLoggingEnabled()) {
+                log(`Adding code_edit tool for Claude 3.7 model: ${normalizedModel}`);
+              }
+              tools.push(this.getCodeEditTool());
+            }
+            
+            requestBody.tools = tools;
             requestBody.tool_choice = { type: "auto" };
           }
           
@@ -608,8 +702,18 @@ class AnthropicClient {
             requestBody.tools = options.tools;
             requestBody.tool_choice = { type: "auto" };
           } else {
-            // Define the shell tool by default
-            requestBody.tools = [this.getShellTool()];
+            // Define our default tools - shell and code_edit for Claude 3.7
+            const tools = [this.getShellTool()];
+            
+            // Add code_edit tool for Claude 3.7 models
+            if (normalizedModel.includes('claude-3-7')) {
+              if (isLoggingEnabled()) {
+                log(`Adding code_edit tool for Claude 3.7 model: ${normalizedModel}`);
+              }
+              tools.push(this.getCodeEditTool());
+            }
+            
+            requestBody.tools = tools;
             requestBody.tool_choice = { type: "auto" };
           }
           
@@ -949,6 +1053,51 @@ class AnthropicClient {
         },
         required: ["command"],
       },
+    };
+  }
+  
+  /**
+   * Get the code_edit tool definition for Claude 3.7
+   * This is a specialized tool for precise code editing operations
+   */
+  getCodeEditTool(): AnthropicTool {
+    return {
+      name: "code_edit",
+      description: "Edit code files with specified operations",
+      input_schema: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Path to the file to edit"
+          },
+          operation: {
+            type: "string",
+            enum: ["insert", "replace", "delete"],
+            description: "Type of edit operation"
+          },
+          position: {
+            type: "object",
+            description: "Where to apply the edit",
+            properties: {
+              start_line: {
+                type: "integer",
+                description: "Start line number (1-indexed)"
+              },
+              end_line: {
+                type: "integer",
+                description: "End line number (1-indexed)"
+              }
+            },
+            required: ["start_line"]
+          },
+          content: {
+            type: "string",
+            description: "New content for insert/replace operations"
+          }
+        },
+        required: ["file_path", "operation", "position"]
+      }
     };
   }
 }
