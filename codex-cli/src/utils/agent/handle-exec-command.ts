@@ -1,6 +1,6 @@
 import type { CommandConfirmation } from "./agent-loop.js";
 import type { AppConfig } from "../config.js";
-import type { ExecInput } from "./sandbox/interface.js";
+import type { ExecInput, ExecOutputMetadata } from "./sandbox/interface.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { ResponseInputItem } from "openai/resources/responses/responses.mjs";
 
@@ -66,7 +66,7 @@ function deriveCommandKey(cmd: Array<string>): string {
 
 type HandleExecCommandResult = {
   outputText: string;
-  metadata: Record<string, unknown>;
+  metadata: ExecOutputMetadata | Record<string, unknown>;
   additionalItems?: Array<ResponseInputItem>;
 };
 
@@ -191,11 +191,40 @@ function convertSummaryToResult(
   summary: ExecCommandSummary,
 ): HandleExecCommandResult {
   const { stdout, stderr, exitCode, durationMs } = summary;
+  
+  // Get token usage data
+  let tokenCount = 0;
+  
+  try {
+    // Import the globalRateLimiter dynamically to avoid circular dependencies
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rateLimiter = require("../rate-limiter.js").globalRateLimiter;
+    
+    // Access the token usage data - we'll use the first provider with data
+    const providers = ["anthropic", "openai"];
+    
+    for (const provider of providers) {
+      // Access the internal usageTrackers map to get token count
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tracker = (rateLimiter as any).usageTrackers?.get(provider);
+      if (tracker && typeof tracker.tokenCount === 'number') {
+        tokenCount = tracker.tokenCount;
+        break;
+      }
+    }
+  } catch (e) {
+    // Ignore any errors in token count retrieval
+    if (isLoggingEnabled()) {
+      log(`Error getting token count: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  
   return {
     outputText: stdout || stderr,
     metadata: {
       exit_code: exitCode,
       duration_seconds: Math.round(durationMs / 100) / 10,
+      token_count: tokenCount,
     },
   };
 }

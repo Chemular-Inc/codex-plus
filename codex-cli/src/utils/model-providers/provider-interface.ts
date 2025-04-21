@@ -7,7 +7,7 @@ import type { AppConfig } from "../config.js";
 import type { ResponseInputItem, ResponseItem } from "openai/resources/responses/responses.mjs";
 
 import { log, isLoggingEnabled } from "../agent/log.js";
-import { globalRateLimiter, executeWithRateLimiting } from "../rate-limiter.js";
+import { globalRateLimiter, executeWithRateLimiting, TimeWindow } from "../rate-limiter.js";
 
 // Shared types across providers
 export enum ModelProvider {
@@ -141,6 +141,37 @@ export class ProviderRegistry {
 
 // Export a singleton instance of the registry
 export const providerRegistry = ProviderRegistry.getInstance();
+
+/**
+ * Track token usage from any provider in the rate limiter
+ * This function should be used by all providers when token usage data is available
+ * 
+ * @param provider The provider name (e.g., "openai", "anthropic")
+ * @param inputTokens Input tokens used
+ * @param outputTokens Output tokens used
+ */
+export function trackProviderTokenUsage(
+  provider: string,
+  inputTokens: number,
+  outputTokens: number
+): void {
+  try {
+    const totalTokens = inputTokens + outputTokens;
+    
+    // Log token usage if debug mode enabled
+    if (isLoggingEnabled()) {
+      log(`Provider token usage (${provider}): input=${inputTokens}, output=${outputTokens}, total=${totalTokens}`);
+    }
+    
+    // Update the rate limiter with this usage
+    globalRateLimiter.trackSuccessfulRequest(provider, totalTokens);
+  } catch (e) {
+    // Never let token tracking issues crash the main flow
+    if (isLoggingEnabled()) {
+      log(`Error tracking token usage: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+}
 
 // Legacy functions that use the registry for backward compatibility
 export function detectProviderFromModel(model: string): ModelProvider {

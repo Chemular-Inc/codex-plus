@@ -5,7 +5,13 @@
 import type { ResponseInputItem, ResponseItem } from "openai/resources/responses/responses.mjs";
 import { log, isLoggingEnabled } from "../agent/log.js";
 import { executeWithRateLimiting } from "../rate-limiter.js";
-import { ModelProvider, ProviderOptions, ModelProviderInterface, providerRegistry } from "./provider-interface.js";
+import { 
+  ModelProvider, 
+  ProviderOptions, 
+  ModelProviderInterface, 
+  providerRegistry,
+  trackProviderTokenUsage
+} from "./provider-interface.js";
 
 /**
  * Implementation for OpenAI provider
@@ -129,6 +135,15 @@ class OpenAIProvider implements ModelProviderInterface {
           }
         }
       );
+      
+      // Track token usage if available
+      if (response.usage) {
+        trackProviderTokenUsage(
+          "openai",
+          response.usage.prompt_tokens || 0,
+          response.usage.completion_tokens || 0
+        );
+      }
       
       return {
         items: response.output,

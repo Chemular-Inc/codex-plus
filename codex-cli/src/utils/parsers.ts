@@ -27,6 +27,7 @@ export function parseToolCallOutput(toolCallOutput: string): {
       metadata: {
         exit_code: 1,
         duration_seconds: 0,
+        token_count: 0,
       },
     };
   }

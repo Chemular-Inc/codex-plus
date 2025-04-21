@@ -27,4 +27,5 @@ export type ExecResult = {
 export type ExecOutputMetadata = {
   exit_code: number;
   duration_seconds: number;
+  token_count?: number;
 };

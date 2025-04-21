@@ -154,7 +154,7 @@ function TerminalChatResponseToolCallOutput({
   fullStdout: boolean;
 }) {
   const { output, metadata } = parseToolCallOutput(message.output);
-  const { exit_code, duration_seconds } = metadata;
+  const { exit_code, duration_seconds, token_count } = metadata;
   const metadataInfo = useMemo(
     () =>
       [
@@ -162,10 +162,13 @@ function TerminalChatResponseToolCallOutput({
         typeof duration_seconds !== "undefined"
           ? `duration: ${duration_seconds}s`
           : "",
+        typeof token_count !== "undefined"
+          ? `tokens: ${token_count}`
+          : "",
       ]
         .filter(Boolean)
         .join(", "),
-    [exit_code, duration_seconds],
+    [exit_code, duration_seconds, token_count],
   );
   let displayedContent = output;
   if (message.type === "function_call_output" && !fullStdout) {
