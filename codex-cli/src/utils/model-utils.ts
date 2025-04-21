@@ -16,35 +16,29 @@ export const SUPPORTED_CLAUDE_MODELS: Array<string> = [
   "claude-3-opus-20240229",
   "claude-3-sonnet-20240229",
   "claude-3-haiku-20240307",
-  "claude-3-7-sonnet-20250219",
   "claude-3-5-sonnet-20240620",
-  "claude-3-5-sonnet-20241022",
-  "claude-3-5-haiku-20241022",
-
-  // Abbreviated model names with hyphens (preferred format for API)
+  "claude-3-5-haiku-20240307",
+  "claude-3-7-sonnet-20250219", // Latest claude model
+  
+  // Friendly names without version numbers
   "claude-3-opus",
   "claude-3-sonnet",
   "claude-3-haiku",
-  "claude-3-7-sonnet",
   "claude-3-5-sonnet",
   "claude-3-5-haiku",
-
-  // Dot notation variants (for user convenience)
-  "claude-3",
-  "claude-3.5",
+  "claude-3-7-sonnet",
+  
+  // Dot notation variants
   "claude-3.5-sonnet",
   "claude-3.5-haiku",
-  "claude-3.7",
-
-  // Named variants
-  "claude-3.5-sonnet-v2",
+  "claude-3.7-sonnet",
 ];
 
-// Interface for resolved model information
+// Type definition for resolved model information
 export interface ResolvedModel {
-  provider: string;
-  modelId: string;
-  displayName: string;
+  provider: string;    // Provider name (openai, anthropic)
+  modelId: string;     // Actual model ID to use with the API
+  displayName: string; // Human-readable display name
 }
 
 // Model aliases mapping friendly names to provider-specific model IDs
@@ -147,163 +141,79 @@ export function resolveModel(modelName: string): ResolvedModel | null {
  * Get all available model alias display names
  */
 export function getAvailableModelAliases(): Array<string> {
-  return Object.values(MODEL_ALIASES).map(model => model.displayName);
+  return Object.keys(MODEL_ALIASES);
 }
 
 /**
- * Format a model name for display
- */
-export function formatModelName(modelName: string): string {
-  const resolved = resolveModel(modelName);
-  return resolved ? resolved.displayName : modelName;
-}
-
-/**
- * Background model loader / cache.
- *
- * We start fetching the list of available models from OpenAI once the CLI
- * enters interactive mode.  The request is made exactly once during the
- * lifetime of the process and the results are cached for subsequent calls.
- */
-
-let modelsPromise: Promise<Array<string>> | null = null;
-
-async function fetchModels(): Promise<Array<string>> {
-  // If the user has not configured an API key we cannot hit the network.
-  if (!OPENAI_API_KEY) {
-    return RECOMMENDED_MODELS;
-  }
-
-  try {
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const list = await openai.models.list();
-
-    const models: Array<string> = [];
-    for await (const model of list as AsyncIterable<{ id?: string }>) {
-      if (model && typeof model.id === "string") {
-        models.push(model.id);
-      }
-    }
-
-    return models.sort();
-  } catch {
-    return [];
-  }
-}
-
-export function preloadModels(): void {
-  if (!modelsPromise) {
-    // Fire‑and‑forget – callers that truly need the list should `await`
-    // `getAvailableModels()` instead.
-    void getAvailableModels();
-  }
-}
-
-export async function getAvailableModels(): Promise<Array<string>> {
-  if (!modelsPromise) {
-    modelsPromise = fetchModels();
-  }
-  return modelsPromise;
-}
-
-/**
- * Maps user-friendly model names to their full API-compatible identifiers
- */
-export const CLAUDE_MODEL_MAP: Record<string, string> = {
-  // Simplified names -> Full API model identifiers
-  "claude-3": "claude-3-opus-20240229",
-  "claude-3.5": "claude-3-5-sonnet-20241022", // Updated to latest version
-  "claude-3.7": "claude-3-7-sonnet-20250219",
-  "claude-3-5": "claude-3-5-sonnet-20241022", // Updated to latest version
-  "claude-3-7": "claude-3-7-sonnet-20250219",
-
-  // Architecture versions without dates -> Dated versions
-  "claude-3-opus": "claude-3-opus-20240229",
-  "claude-3-sonnet": "claude-3-sonnet-20240229",
-  "claude-3-haiku": "claude-3-haiku-20240307",
-  "claude-3-5-sonnet": "claude-3-5-sonnet-20241022", // Updated to latest version
-  "claude-3-5-haiku": "claude-3-5-haiku-20241022", // New model
-  "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
-
-  // Named variants
-  "claude-3.5-sonnet": "claude-3-5-sonnet-20241022", // New format with dot notation
-  "claude-3.5-haiku": "claude-3-5-haiku-20241022", // New format with dot notation
-  "claude-3.5-sonnet-v2": "claude-3-5-sonnet-20241022", // V2 alias
-
-  // Already complete models should map to themselves (for lookup safety)
-  "claude-3-opus-20240229": "claude-3-opus-20240229",
-  "claude-3-sonnet-20240229": "claude-3-sonnet-20240229",
-  "claude-3-haiku-20240307": "claude-3-haiku-20240307",
-  "claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219",
-  "claude-3-5-sonnet-20240620": "claude-3-5-sonnet-20240620", // Keep older version for compat
-  "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022", // New version
-  "claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022", // New model
-};
-
-/**
- * Map user-friendly model names to API-compatible model names
+ * Normalize model name - especially useful for Claude models which may be
+ * specified in dot notation (claude-3.5) vs dash notation (claude-3-5)
  */
 export function normalizeModelName(model: string): string {
-  if (!model) return model;
-
-  const lowerModel = model.toLowerCase();
-
-  // Handle Claude models
-  if (lowerModel.includes("claude")) {
-    // First replace dots with hyphens in version numbers
-    let normalizedName = lowerModel.replace(/(\d+)\.(\d+)/g, "$1-$2");
-
-    // Look up the exact API model in our mapping
-    const exactModel = CLAUDE_MODEL_MAP[normalizedName];
-    if (exactModel) {
-      return exactModel;
-    }
-
-    // Special handling for "v2" and other variant names
-    if (normalizedName.includes("-v")) {
-      // Extract the base model name without the variant suffix
-      const baseModelName = normalizedName.replace(/-v\d+$/, "");
-      const baseMapping = CLAUDE_MODEL_MAP[baseModelName];
-      if (baseMapping) {
-        return baseMapping;
-      }
-    }
-
-    // If not in our map but has claude in the name,
-    // return the normalized name (dots -> hyphens)
-    return normalizedName;
+  // Check if it's a model alias and use the resolved model ID
+  const resolvedModel = resolveModel(model);
+  if (resolvedModel) {
+    return resolvedModel.modelId;
   }
-
-  // For all other models (OpenAI, etc.), return as is
+  
+  // For Claude models with dot notation, convert to dash notation
+  // e.g., claude-3.5-sonnet -> claude-3-5-sonnet
+  if (model.includes(".") && model.startsWith("claude")) {
+    return model.replace(/\./g, "-");
+  }
+  
+  // Return the original model name if no normalization is needed
   return model;
 }
 
+export type ListModelsResult = {
+  unavailable: boolean;
+  all: Array<string>;
+  agentic: Array<string>;
+};
+
 /**
- * Verify that the provided model identifier is present in the set returned by
- * {@link getAvailableModels} or is a supported Claude model.
- * The list of models is fetched from the OpenAI `/models` endpoint the first time
+ * Checks if the provided model name is supported for use with the Responses API.
+ * Caches the model list the first time it is called so it is cached for future
+ * invocations.
+ *
+ * We apply a strict timeout to the model‑listing API call to avoid a slow
+ * initial response if the user isn't using an already known model. The timeout
+ * is short (2s) because fetching the model list is a non‑critical enhancement
+ * rather than a core function – if the API is slow, we'd rather proceed without
+ * this information than wait several seconds before the user sees their first
+ * prompt.
+ *
+ * @returns `true` if we can confirm model support, `false` otherwise.
+ *
+ * Note: The actual model list is only fetched from the OpenAI API once per runtime if
  * it is required and then cached in‑process.
  */
 export async function isModelSupportedForResponses(
   model: string | undefined | null,
 ): Promise<boolean> {
-<<<<<<< HEAD
-  if (isLoggingEnabled()) {
-    log(`Checking if model is supported: ${model}`);
+  if (!model) {
+    return false;
   }
   
-=======
-  // Handle empty model or recommended models
->>>>>>> stable-ui
+  // Check if it's in our recommended models list for a quick pass
   if (
-    typeof model !== "string" ||
-    model.trim() === "" ||
+    [
+      "gpt-4",
+      "gpt-3.5-turbo",
+      "o1",
+      "o1-mini",
+      "o1-preview",
+      "o2",
+      "o3",
+      "o3-mini",
+      "o4",
+      "o4-mini",
+    ].includes(model) ||
     RECOMMENDED_MODELS.includes(model)
   ) {
     return true;
   }
 
-<<<<<<< HEAD
   // If we can resolve the model to any provider, consider it supported
   const resolvedModel = resolveModel(model);
   if (resolvedModel) {
@@ -312,46 +222,99 @@ export async function isModelSupportedForResponses(
     }
     return true;
   }
-
-  // Fall back to checking OpenAI models list for backward compatibility
-=======
-  // Normalize the model name first to ensure we're checking the correct format
-  const normalizedModel = normalizeModelName(model);
-
-  // Check if this is a Claude model
-  const provider = detectProviderFromModel(normalizedModel);
-  if (provider === ModelProvider.ANTHROPIC) {
-    // If it's in our Claude model map, it's definitely supported
-    if (Object.keys(CLAUDE_MODEL_MAP).includes(normalizedModel.toLowerCase())) {
-      return true;
-    }
-
-    // If the model has "claude" in it but is not in our map,
-    // we'll still accept it (for flexibility with future models)
-    if (normalizedModel.toLowerCase().includes("claude")) {
-      return true;
-    }
-  }
-
-  // For OpenAI models, check against the API
->>>>>>> stable-ui
-  try {
-    const models = await Promise.race<Array<string>>([
-      getAvailableModels(),
-      new Promise<Array<string>>((resolve) =>
-        setTimeout(() => resolve([]), MODEL_LIST_TIMEOUT_MS),
-      ),
-    ]);
-
-    // If the timeout fired we get an empty list → treat as supported to avoid
-    // false negatives.
-    if (models.length === 0) {
-      return true;
-    }
-
-    return models.includes(normalizedModel.trim());
-  } catch {
-    // Network or library failure → don't block start‑up.
+  
+  // For Claude models, check against our supported list
+  if (model.startsWith("claude-") || SUPPORTED_CLAUDE_MODELS.includes(model)) {
     return true;
   }
+  
+  // If this is an OpenAI model, check the OpenAI API
+  if (detectProviderFromModel(model) === ModelProvider.OPENAI) {
+    try {
+      if (!OPENAI_API_KEY) {
+        return false;
+      }
+      
+      const models = await preloadModels();
+      return models.agentic.includes(model);
+    } catch (e) {
+      if (isLoggingEnabled()) {
+        log(`Error checking model support: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      return false;
+    }
+  }
+  
+  return false;
+}
+
+// Global model list cache to avoid refetching the models.
+let _modelsList: ListModelsResult | null = null;
+
+/**
+ * Preload a list of model names, primarily for display in UI elements.
+ * This is safe to call multiple times because it caches the result.
+ */
+export async function preloadModels(): Promise<ListModelsResult> {
+  // Return cached results if available
+  if (_modelsList) {
+    return _modelsList;
+  }
+
+  // Default result - used if API call fails or times out
+  let result: ListModelsResult = {
+    unavailable: true,
+    all: [...RECOMMENDED_MODELS],
+    agentic: [...RECOMMENDED_MODELS],
+  };
+
+  // Try to fetch from API with timeout
+  if (OPENAI_API_KEY) {
+    try {
+      // Create a client to fetch model list
+      const client = new OpenAI({
+        apiKey: OPENAI_API_KEY,
+      });
+
+      // Use Promise.race to implement timeout
+      const modelsPromise = client.models.list();
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`OpenAI model list request timed out after ${MODEL_LIST_TIMEOUT_MS}ms`));
+        }, MODEL_LIST_TIMEOUT_MS);
+      });
+
+      // Wait for either promise to resolve
+      const models = await Promise.race([modelsPromise, timeoutPromise]) as Awaited<ReturnType<typeof client.models.list>>;
+
+      // Extract model IDs
+      const allIds = models.data.map((m) => m.id);
+      
+      // All 'gpt-' models plus o1, o2, o3, o4 variants can use the Responses API
+      const agentic = allIds.filter(
+        (id) => id.startsWith("gpt-") || /^o\d(-.*)?$/.test(id)
+      );
+
+      result = {
+        unavailable: false,
+        all: allIds,
+        agentic,
+      };
+      
+      if (isLoggingEnabled()) {
+        log(`Loaded ${allIds.length} models from OpenAI API (${agentic.length} support responses)`);
+      }
+    } catch (e) {
+      if (isLoggingEnabled()) {
+        log(`Could not load models: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      
+      // Fall back to recommended models on error
+      result.unavailable = true;
+    }
+  }
+
+  // Cache the result for future calls
+  _modelsList = result;
+  return result;
 }
