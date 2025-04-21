@@ -256,14 +256,14 @@ let config = loadConfig(undefined, undefined, {
 const prompt = cli.input[0];
 const rawModel = cli.flags.model as string | undefined;
 // Normalize the model name if provided, especially for Claude models
-const model = rawModel ? normalizeModelName(rawModel) : undefined;
+let normalizedModel = rawModel ? normalizeModelName(rawModel) : undefined;
 const imagePaths = cli.flags.image as Array<string> | undefined;
 
 // Apply model resolution for user-friendly aliases
-if (model) {
-  const resolvedModel = resolveModel(model);
+if (normalizedModel) {
+  const resolvedModel = resolveModel(normalizedModel);
   if (resolvedModel) {
-    model = resolvedModel.modelId;
+    normalizedModel = resolvedModel.modelId;
   }
 }
 
@@ -273,7 +273,7 @@ config = {
   openaiBaseUrl: process.env.OPENAI_BASE_URL || undefined,
   anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || undefined,
   ...config,
-  model: model ?? config.model,
+  model: normalizedModel ?? config.model,
   notify: Boolean(cli.flags.notify),
 };
 
