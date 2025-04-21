@@ -145,6 +145,13 @@ export function getAvailableModelAliases(): Array<string> {
 }
 
 /**
+ * Get all available models - for backward compatibility
+ */
+export function getAvailableModels(): Array<string> {
+  return Object.keys(MODEL_ALIASES);
+}
+
+/**
  * Normalize model name - especially useful for Claude models which may be
  * specified in dot notation (claude-3.5) vs dash notation (claude-3-5)
  */
