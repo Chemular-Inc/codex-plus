@@ -33,6 +33,20 @@ class OpenAIProvider implements ModelProviderInterface {
     });
   }
   
+  /**
+   * Check if a response requires additional tool processing
+   * OpenAI handles tools differently - we don't need to continue the loop with tool results
+   * @param response The response to check
+   * @returns false for OpenAI provider
+   */
+  public requiresToolProcessing(response: {
+    items: Array<ResponseItem>;
+    response_id: string;
+  }): boolean {
+    // OpenAI handles tool calls within its own API flow
+    return false;
+  }
+  
   async sendMessage(
     input: Array<ResponseInputItem>,
     options: {
@@ -41,6 +55,7 @@ class OpenAIProvider implements ModelProviderInterface {
       temperature?: number;
       previousResponseId?: string;
       conversationId?: string;
+      thinking?: { budgetTokens: number };
     }
   ): Promise<{
     items: Array<ResponseItem>;

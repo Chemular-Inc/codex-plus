@@ -578,9 +578,47 @@ export class AgentLoop {
               lastResponseId = response.response_id;
               this.onLastResponseId(response.response_id);
               
-              // Clear turn input to exit the loop
-              turnInput = [];
-              break;
+              // PROVIDER-AGNOSTIC: Check if the provider requires tool processing
+              // This delegates the decision to each provider implementation 
+              if (this.provider && typeof this.provider.requiresToolProcessing === 'function' && 
+                  this.provider.requiresToolProcessing(response)) {
+                if (isLoggingEnabled()) {
+                  log(`Provider ${this.provider.provider} requires tool processing - continuing the loop to process tool result`);
+                }
+                
+                // Extract tool calls from the response and process them
+                const functionCalls = response.items.filter(item => item.type === "function_call");
+                
+                if (isLoggingEnabled()) {
+                  log(`Found ${functionCalls.length} function calls to process`);
+                }
+                
+                // We need to clear turnInput first, then populate it with tool results
+                turnInput = [];
+                
+                // Process each function call and get the results
+                for (const functionCall of functionCalls) {
+                  // eslint-disable-next-line no-await-in-loop
+                  const result = await this.handleFunctionCall(functionCall);
+                  turnInput.push(...result);
+                  
+                  if (isLoggingEnabled()) {
+                    log(`Processed function call ${functionCall.name}, got ${result.length} result items`);
+                  }
+                }
+                
+                if (isLoggingEnabled()) {
+                  log(`Continuing loop with ${turnInput.length} tool results for ${this.provider.provider}`);
+                }
+                
+                // IMPORTANT: We must continue the loop with the tool results
+                // For the tool use flow to complete properly
+                continue; // Use continue instead of break to ensure loop continues
+              } else {
+                // Normal case or other provider - exit the loop
+                turnInput = [];
+                break;
+              }
             } else {
               // Use direct OpenAI client for backward compatibility
               // eslint-disable-next-line no-await-in-loop
@@ -779,7 +817,11 @@ export class AgentLoop {
             throw error;
           }
         }
-        turnInput = []; // clear turn input, prepare for function call results
+        // Only clear the turn input if we're not handling a provider-specific tool call flow
+        // For providers that need tool processing, we would have already set turnInput in the continue case above
+        if (!turnInput.length) {
+          turnInput = []; // clear turn input, prepare for function call results
+        }
 
         // If the user requested cancellation while we were awaiting the network
         // request, abort immediately before we start handling the stream.
@@ -872,11 +914,13 @@ export class AgentLoop {
           this.currentStream = null;
         }
 
-        log(
-          `Turn inputs (${turnInput.length}) - ${turnInput
-            .map((i) => i.type)
-            .join(", ")}`,
-        );
+        if (isLoggingEnabled()) {
+          log(
+            `Turn inputs (${turnInput.length}) - ${turnInput
+              .map((i) => i.type)
+              .join(", ")}`,
+          );
+        }
       }
 
       // Flush staged items if the run concluded successfully (i.e. the user did

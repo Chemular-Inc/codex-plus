@@ -4,10 +4,12 @@
  */
 
 import type { AppConfig } from "../config.js";
-import type { ResponseInputItem, ResponseItem } from "openai/resources/responses/responses.mjs";
+import type {
+  ResponseInputItem,
+  ResponseItem,
+} from "openai/resources/responses/responses.mjs";
 
 import { log, isLoggingEnabled } from "../agent/log.js";
-import { globalRateLimiter, executeWithRateLimiting } from "../rate-limiter.js";
 
 // Shared types across providers
 export enum ModelProvider {
@@ -34,17 +36,32 @@ export interface ModelProviderInterface {
       temperature?: number;
       previousResponseId?: string;
       conversationId?: string;
-    }
+      thinking?: { budgetTokens: number };
+    },
   ): Promise<{
     items: Array<ResponseItem>;
     response_id: string;
   }>;
+  
+  /**
+   * Check if a response requires additional tool processing
+   * Used to determine if the agent loop should continue with tool results
+   * @param response The response to check
+   * @returns true if the response needs tool processing, false otherwise
+   */
+  requiresToolProcessing?(response: {
+    items: Array<ResponseItem>;
+    response_id: string;
+  }): boolean;
 }
 
 // Registry to manage provider implementations
 export class ProviderRegistry {
   private static instance: ProviderRegistry;
-  private providers: Map<ModelProvider, (options: ProviderOptions) => Promise<ModelProviderInterface>>;
+  private providers: Map<
+    ModelProvider,
+    (options: ProviderOptions) => Promise<ModelProviderInterface>
+  >;
   private modelPatterns: Map<ModelProvider, RegExp[]>;
 
   private constructor() {
@@ -63,7 +80,7 @@ export class ProviderRegistry {
   public registerProvider(
     provider: ModelProvider,
     factory: (options: ProviderOptions) => Promise<ModelProviderInterface>,
-    modelPatterns: RegExp[]
+    modelPatterns: RegExp[],
   ): void {
     this.providers.set(provider, factory);
     this.modelPatterns.set(provider, modelPatterns);
@@ -72,7 +89,7 @@ export class ProviderRegistry {
   // Detect provider from model name
   public detectProviderFromModel(model: string): ModelProvider {
     const lowerModel = model.toLowerCase();
-    
+
     for (const [provider, patterns] of this.modelPatterns.entries()) {
       for (const pattern of patterns) {
         if (pattern.test(lowerModel)) {
@@ -80,7 +97,7 @@ export class ProviderRegistry {
         }
       }
     }
-    
+
     // Default to OpenAI if no match found
     if (isLoggingEnabled()) {
       log(`No provider match found for model ${model}, defaulting to OpenAI`);
@@ -89,48 +106,54 @@ export class ProviderRegistry {
   }
 
   // Create provider instance based on model name
-  public async createProvider(options: ProviderOptions): Promise<ModelProviderInterface> {
+  public async createProvider(
+    options: ProviderOptions,
+  ): Promise<ModelProviderInterface> {
     const provider = this.detectProviderFromModel(options.model);
     const factory = this.providers.get(provider);
-    
+
     if (!factory) {
       throw new Error(`No provider implementation found for ${provider}`);
     }
-    
+
     return factory(options);
   }
 
   // Create provider from app config
-  public async createProviderFromConfig(config: AppConfig): Promise<ModelProviderInterface> {
+  public async createProviderFromConfig(
+    config: AppConfig,
+  ): Promise<ModelProviderInterface> {
     const model = config.model;
     const provider = this.detectProviderFromModel(model);
-    
+
     // Determine the API key based on provider
     let apiKey: string;
     let baseUrl: string | undefined;
-    
+
     if (provider === ModelProvider.ANTHROPIC) {
-      apiKey = config.anthropicApiKey || process.env.ANTHROPIC_API_KEY || "";
-      baseUrl = config.anthropicBaseUrl || process.env.ANTHROPIC_BASE_URL;
-      
+      apiKey = config.anthropicApiKey || process.env["ANTHROPIC_API_KEY"] || "";
+      baseUrl = config.anthropicBaseUrl || process.env["ANTHROPIC_BASE_URL"];
+
       if (!apiKey) {
         throw new Error(
-          "Anthropic API key is required for Claude models. Set ANTHROPIC_API_KEY environment variable."
+          "Anthropic API key is required for Claude models. Set ANTHROPIC_API_KEY environment variable.",
         );
       }
     } else if (provider === ModelProvider.OPENAI) {
-      apiKey = config.apiKey || process.env.OPENAI_API_KEY || "";
-      baseUrl = config.openaiBaseUrl || process.env.OPENAI_BASE_URL;
-      
+      apiKey = config.apiKey || process.env["OPENAI_API_KEY"] || "";
+      baseUrl = config.openaiBaseUrl || process.env["OPENAI_BASE_URL"];
+
       if (!apiKey) {
         throw new Error(
-          "OpenAI API key is required. Set OPENAI_API_KEY environment variable."
+          "OpenAI API key is required. Set OPENAI_API_KEY environment variable.",
         );
       }
     } else {
-      throw new Error(`Provider ${provider} is not configured to load API keys`);
+      throw new Error(
+        `Provider ${provider} is not configured to load API keys`,
+      );
     }
-    
+
     return this.createProvider({
       apiKey,
       baseUrl,
@@ -149,12 +172,14 @@ export function detectProviderFromModel(model: string): ModelProvider {
 
 export async function createProvider(
   provider: ModelProvider,
-  options: ProviderOptions
+  options: ProviderOptions,
 ): Promise<ModelProviderInterface> {
   return providerRegistry.createProvider(options);
 }
 
-export async function createProviderFromConfig(config: AppConfig): Promise<ModelProviderInterface> {
+export async function createProviderFromConfig(
+  config: AppConfig,
+): Promise<ModelProviderInterface> {
   return providerRegistry.createProviderFromConfig(config);
 }
 
