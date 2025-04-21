@@ -645,39 +645,37 @@ function TerminalChatInputThinking({
     { isActive: active },
   );
 
-  // Generate progress bar
-  const progressBarLength = 10;
-  const filledBars = Math.max(1, Math.floor((percentUsed / 100) * progressBarLength));
-  const emptyBars = progressBarLength - filledBars;
+  // Use the classic ball animation for consistency and clarity
+  const ballFrames = [
+    "( ●    )",
+    "(  ●   )",
+    "(   ●  )",
+    "(    ● )",
+    "(     ●)",
+    "(    ● )",
+    "(   ●  )",
+    "(  ●   )",
+    "( ●    )",
+    "(●     )",
+  ];
   
-  // Current spinner frame
-  const spinnerChar = spinnerFrames[frame];
+  // Current ball frame
+  const ballFrame = ballFrames[frame];
+  
+  // Compact info section with subtle color coding for tokens
+  const tokenCountDisplay = tokenCount > 0 
+    ? <Text color={tokenColor}> • {formattedTokenCount} tokens</Text> 
+    : '';
   
   return (
     <Box flexDirection="column" gap={1}>
-      <Box gap={1} flexDirection="column">
-        <Box>
-          <Text>
-            <Text color="cyan">{spinnerChar} </Text>
-            <Text bold color="magenta">Thinking{dots}</Text>
-            <Text dimColor> • {thinkingSeconds}s elapsed</Text>
-          </Text>
-        </Box>
-        
-        <Box>
-          <Text>
-            <Text color="cyan">⟨</Text>
-            <Text bold>Tokens: {formattedTokenCount}</Text>
-            <Text color="cyan">⟩</Text>
-            {' '}
-            <Text color="gray">┃</Text>
-            <Text color={tokenColor}>{'█'.repeat(filledBars)}</Text>
-            <Text dimColor>{'░'.repeat(emptyBars)}</Text>
-            <Text color="gray">┃</Text>
-            {' '}
-            <Text dimColor>{percentUsed}%</Text>
-          </Text>
-        </Box>
+      <Box>
+        <Text>
+          <Text>{ballFrame} </Text>
+          <Text bold>Thinking{dots}</Text>
+          <Text dimColor> • {thinkingSeconds}s</Text>
+          {tokenCountDisplay}
+        </Text>
       </Box>
       
       {awaitingConfirm && (
