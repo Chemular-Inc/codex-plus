@@ -1,0 +1,1234 @@
+/**
+ * Anthropic Claude API integration for Codex CLI
+ * This module provides integration with Claude AI models
+ */
+
+import type {
+  ResponseInputItem,
+  ResponseItem,
+} from "openai/resources/responses/responses.mjs";
+import { log, isLoggingEnabled } from "../agent/log.js";
+import { executeWithRateLimiting, TimeWindow } from "../rate-limiter.js";
+import { isRateLimitError } from "../error-types.js";
+import {
+  ModelProvider,
+  ProviderOptions,
+  ModelProviderInterface,
+  providerRegistry,
+  trackProviderTokenUsage
+} from "./provider-interface.js";
+import { normalizeModelName } from "../model-utils.js";
+
+// Types mirroring Anthropic API structures
+interface AnthropicMessage {
+  role: "user" | "assistant" | "system";
+  content: AnthropicContent[];
+}
+
+type AnthropicContent =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: string; data: string };
+    };
+
+interface AnthropicTool {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+}
+
+interface AnthropicToolResult {
+  tool_use_id: string;
+  output: string | Record<string, unknown>;
+}
+
+// Mapping function between OpenAI and Anthropic formats
+/**
+ * Map OpenAI format messages to Anthropic format
+ * This is a critical component - we must ensure Anthropic gets the full conversation context
+ * Anthropic needs to see the complete back-and-forth to maintain context
+ */
+function mapOpenAIInputToAnthropic(input: Array<ResponseInputItem>): {
+  messages: Array<AnthropicMessage>;
+  toolResults: Array<AnthropicToolResult>;
+} {
+  // Store messages in order they appear
+  const messages: Array<AnthropicMessage> = [];
+  // Store all tool results to pass to Anthropic
+  const toolResults: Array<AnthropicToolResult> = [];
+
+  // Message ordering is critical for context
+  let messageCounter = 0;
+
+  // Debug to see what we're working with
+  if (isLoggingEnabled()) {
+    log(`========== CONVERSATION MAPPING ==========`);
+    log(`Converting ${input.length} items to Anthropic format`);
+    log(`Input item types: ${input.map((i) => i.type).join(", ")}`);
+  }
+
+  // First process all items to capture the complete conversation
+  for (const item of input) {
+    // Process message items (user and assistant messages)
+    if (item.type === "message") {
+      messageCounter++;
+
+      // Detailed logging
+      if (isLoggingEnabled()) {
+        log(
+          `Message #${messageCounter} - role: ${item.role}, content items: ${
+            item.content?.length || 0
+          }`,
+        );
+        if (item.content && item.content.length > 0) {
+          const previewText = item.content[0]?.toString();
+          log(`  Preview: "${previewText}..."`);
+        }
+      }
+
+      // Create Anthropic message object
+      const message: AnthropicMessage = {
+        role: item.role as "user" | "assistant" | "system",
+        content: [],
+      };
+
+      // Process all content in this message
+      if (item.content && item.content.length > 0) {
+        for (const contentItem of item.content) {
+          // Handle text content (most common)
+          if (
+            (contentItem.type === "input_text" ||
+              contentItem.type === "output_text") &&
+            contentItem.text
+          ) {
+            message.content.push({
+              type: "text",
+              text: contentItem.text,
+            });
+          }
+          // Handle image content
+          else if (
+            contentItem.type === "input_image" &&
+            "image_url" in contentItem
+          ) {
+            message.content.push({
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg",
+                data: contentItem.image_url.replace(
+                  /^data:image\/[^;]+;base64,/,
+                  "",
+                ),
+              },
+            });
+          }
+        }
+      }
+
+      // Only add messages that have content
+      if (message.content.length > 0) {
+        messages.push(message);
+      }
+    }
+    // Process function call outputs (tool results)
+    else if (item.type === "function_call_output" && "call_id" in item) {
+      toolResults.push({
+        tool_use_id: item.call_id,
+        output: item.output,
+      });
+
+      if (isLoggingEnabled()) {
+        log(`Tool result for call_id: ${item.call_id}`);
+      }
+    }
+  }
+
+  // Print detailed conversation flow for debugging
+  if (isLoggingEnabled()) {
+    log(`\nFinal conversation structure: ${messages.length} messages`);
+    log(`Conversation flow:`);
+
+    messages.forEach((msg, idx) => {
+      const contentPreview = msg.content[0]?.text?.substring(0, 20) || "";
+      log(`  ${idx + 1}. [${msg.role}] -> "${contentPreview}..."`);
+    });
+
+    log(`Tool results: ${toolResults.length}`);
+    log(`========== END MAPPING ==========\n`);
+  }
+
+  // Messages array must have at least one entry for the current user message
+  if (messages.length === 0) {
+    if (isLoggingEnabled()) {
+      log(`WARNING: No valid messages found in input! Adding placeholder.`);
+    }
+
+    // Add a placeholder message if somehow we didn't get any
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "Hello",
+        },
+      ],
+    });
+  }
+
+  return { messages, toolResults };
+}
+
+// Map Anthropic responses back to OpenAI format for Codex
+interface AnthropicResponse {
+  id?: string;
+  content?: Array<{ type: string; text?: string }>;
+  tool_uses?: Array<{
+    id: string;
+    name: string;
+    input: Record<string, unknown>;
+  }>;
+}
+
+function mapAnthropicResponseToOpenAI(
+  anthropicResponse: AnthropicResponse,
+  conversationId: string,
+): Array<ResponseItem> {
+  const responseItems: Array<ResponseItem> = [];
+
+  // First process tool calls so they appear before the message content in the response
+  // This is important because the agent loop processes items in order
+  if (anthropicResponse.tool_uses && anthropicResponse.tool_uses.length > 0) {
+    for (const toolUse of anthropicResponse.tool_uses) {
+      // Create function call item with proper typing
+      const functionCallItem: ResponseItem = {
+        id: toolUse.id || `tool-${Date.now()}`,
+        type: "function_call",
+        name: toolUse.name,
+        call_id: toolUse.id || `tool-${Date.now()}`,
+        arguments: JSON.stringify(toolUse.input),
+      };
+
+      // For shell commands, make sure the argument format is compatible
+      if (
+        toolUse.name === "shell" &&
+        toolUse.input &&
+        typeof toolUse.input === "object"
+      ) {
+        const input = toolUse.input as Record<string, unknown>;
+        if (input.command && typeof input.command === "string") {
+          const commandArgs = input.command.split(/\s+/).filter(Boolean);
+          if (commandArgs.length > 0) {
+            const newArguments = {
+              ...input,
+              command: commandArgs,
+            };
+            functionCallItem.arguments = JSON.stringify(newArguments);
+          }
+        }
+      }
+
+      responseItems.push(functionCallItem);
+    }
+  }
+
+  // Map the main message content after tool calls
+  if (anthropicResponse.content && anthropicResponse.content.length > 0) {
+    // Create properly typed content array for the message
+    const content: Array<{ type: string; text: string }> = [];
+
+    for (const contentBlock of anthropicResponse.content) {
+      if (contentBlock.type === "text" && contentBlock.text) {
+        content.push({
+          type: "output_text",
+          text: contentBlock.text,
+        });
+      }
+    }
+
+    if (content.length > 0) {
+      const messageItem: ResponseItem = {
+        id: `${conversationId}-message`,
+        type: "message",
+        role: "assistant",
+        content,
+      };
+
+      responseItems.push(messageItem);
+    }
+  }
+
+  // Ensure we always have at least an empty message if nothing else
+  if (responseItems.length === 0) {
+    responseItems.push({
+      id: `${conversationId}-empty`,
+      type: "message",
+      role: "assistant",
+      content: [
+        {
+          type: "output_text",
+          text: "I'll help with that.",
+        },
+      ],
+    });
+  }
+
+  return responseItems;
+}
+
+/**
+ * Anthropic client implementation
+ */
+class AnthropicClient {
+  private apiKey: string;
+  private baseUrl: string;
+  private defaultModel: string;
+
+  // Reference to the provider that created this client for callback purposes
+  _provider: any = null;
+
+  constructor(
+    apiKey: string,
+    options?: { baseUrl?: string; defaultModel?: string; provider?: any },
+  ) {
+    this.apiKey = apiKey;
+    this.baseUrl = options?.baseUrl || "https://api.anthropic.com/v1";
+    // Use normalized model name and a more reliable default model
+    const defaultModel = options?.defaultModel || "claude-3-sonnet";
+    this.defaultModel = normalizeModelName(defaultModel);
+
+    // Store provider reference for callback purposes
+    if (options?.provider) {
+      this._provider = options.provider;
+    }
+  }
+
+  /**
+   * Main method to send messages to Anthropic Claude
+   * This version can accept either ResponseInputItem[] (OpenAI format)
+   * or AnthropicMessage[] (Anthropic format) for more flexibility
+   */
+  async sendMessage(
+    input: Array<ResponseInputItem> | Array<AnthropicMessage>,
+    options?: {
+      model?: string;
+      system?: string;
+      maxTokens?: number;
+      temperature?: number;
+      conversationId?: string;
+      previousResponseId?: string;
+      tools?: Array<AnthropicTool>;
+      toolResults?: Array<AnthropicToolResult>;
+      thinking?: { budgetTokens: number };
+      stream?: boolean;
+    },
+  ): Promise<AsyncIterable<any>> {
+    // Use normalized model name to ensure compatibility with Anthropic API
+    const rawModel = options?.model || this.defaultModel;
+    const model = normalizeModelName(rawModel);
+    const conversationId = options?.conversationId || `conv_${Date.now()}`;
+    const previousResponseId = options?.previousResponseId;
+
+    let messages: Array<AnthropicMessage>;
+    let toolResults: Array<AnthropicToolResult> = options?.toolResults || [];
+
+    // Handle both input formats:
+    // 1. If input is already in Anthropic format (Array<AnthropicMessage>), use it directly
+    // 2. If input is in OpenAI format (Array<ResponseInputItem>), convert it
+    if (input.length > 0 && "role" in input[0] && "content" in input[0]) {
+      // Input is already in Anthropic format
+      messages = input as Array<AnthropicMessage>;
+
+      if (isLoggingEnabled()) {
+        log(`Using pre-converted Anthropic messages (${messages.length})`);
+      }
+    } else {
+      // Convert input from OpenAI format to Anthropic format
+      const converted = mapOpenAIInputToAnthropic(
+        input as Array<ResponseInputItem>,
+      );
+      messages = converted.messages;
+
+      // Merge with any tool results passed in options
+      if (converted.toolResults && converted.toolResults.length > 0) {
+        toolResults = [...toolResults, ...converted.toolResults];
+      }
+
+      if (isLoggingEnabled()) {
+        log(`Converted OpenAI format to ${messages.length} Anthropic messages`);
+      }
+    }
+
+    // Call Anthropic API with rate limiting
+    try {
+      // Debug logging to trace conversation context issues
+      if (isLoggingEnabled()) {
+        log(`Claude conversation context - messages: ${messages.length}`);
+        const userMsgs = messages.filter((m) => m.role === "user").length;
+        const assistantMsgs = messages.filter(
+          (m) => m.role === "assistant",
+        ).length;
+        log(
+          `Message breakdown - user: ${userMsgs}, assistant: ${assistantMsgs}`,
+        );
+
+        // Log any tool results being sent
+        if (toolResults.length > 0) {
+          log(`Tool results being sent: ${toolResults.length}`);
+        }
+      }
+
+      // Advanced token estimation for Claude models
+      // More accurate than generic byte-based estimates, better for rate limiting
+      const estimatedTokens = this.estimateTokenCount(
+        messages,
+        options?.system,
+      );
+      
+      if (isLoggingEnabled()) {
+        log(`Anthropic request estimated tokens: ${estimatedTokens}`);
+        log(`Request complexity: ${messages.length} messages, system prompt: ${options?.system ? 'yes' : 'no'}`);
+      }
+
+      // Enhanced rate limiting for Anthropic
+      // This respects their rate limits while making efficient use of the available quota
+      const response = await executeWithRateLimiting(
+        "anthropic",
+        async () => {
+          // Prepare request payload
+          interface AnthropicRequestBody {
+            model: string;
+            messages: Array<AnthropicMessage>;
+            max_tokens: number;
+            temperature: number;
+            system?: string;
+            tools?: Array<AnthropicTool>;
+            tool_choice?: { type: string };
+            tool_results?: Array<AnthropicToolResult>;
+            thinking?: {
+              type: "enabled" | "disabled";
+              budget_tokens?: number;
+            };
+            stream?: boolean;
+          }
+
+          const requestBody: AnthropicRequestBody = {
+            model,
+            messages,
+            max_tokens: options?.maxTokens || 4096,
+            temperature: options?.temperature || 0.7,
+          };
+
+          // Add thinking parameter for Claude 3.7+ models
+          if (model.includes("claude-3-7") || model.includes("claude-3.7")) {
+            if (options?.thinking) {
+              requestBody.thinking = {
+                type: "enabled",
+                budget_tokens: options.thinking.budgetTokens,
+              };
+              // When thinking is enabled, temperature MUST be set to 1
+              requestBody.temperature = 1;
+            } else {
+              requestBody.thinking = {
+                type: "enabled",
+                budget_tokens: 3000, // Default token budget
+              };
+              // When thinking is enabled, temperature MUST be set to 1
+              requestBody.temperature = 1;
+            }
+          }
+
+          // Add system instruction if provided
+          if (options?.system) {
+            // Enhance system prompt for Claude to encourage tool usage
+            // Keep it similar to what OpenAI would receive, just with guidance on using tools
+            const toolUsageInstructions = `
+IMPORTANT: You have access to a shell tool. Use it when needed to:
+- List directories and explore files (ls)
+- Search for code or files (grep, find)
+- Run commands to accomplish tasks
+- Execute code or tests
+
+First use the shell tool to gather information before responding substantively.
+`;
+            requestBody.system = `${options.system}\n\n${toolUsageInstructions}`;
+          }
+
+          // IMPORTANT: Define tools to match OpenAI's implementation exactly
+          // With Anthropic-specific format but identical functionality
+          requestBody.tools = [
+            {
+              name: "shell",
+              description: "Runs a shell command, and returns its output.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  command: {
+                    // OpenAI uses array format, but we need to document it differently for Anthropic
+                    // The mapping function will convert string to array format when needed
+                    type: "string",
+                    description:
+                      "The command to execute as a string. Will be split into command and arguments.",
+                  },
+                  workdir: {
+                    type: "string",
+                    description: "The working directory for the command.",
+                  },
+                  timeout: {
+                    type: "number",
+                    description:
+                      "The maximum time to wait for the command to complete in milliseconds.",
+                  },
+                },
+                required: ["command"],
+              },
+            },
+          ];
+
+          // Set tool_choice to match OpenAI's expected behavior
+          // For Anthropic, we need to explicitly set this as an object
+          requestBody.tool_choice = { type: "auto" };
+
+          // Add tool results if available
+          if (
+            toolResults.length > 0 ||
+            (options?.toolResults && options.toolResults.length > 0)
+          ) {
+            requestBody.tool_results = [
+              ...(options?.toolResults || []),
+              ...toolResults,
+            ];
+          }
+
+          if (isLoggingEnabled()) {
+            log(
+              `Sending request to Anthropic: ${JSON.stringify(
+                requestBody,
+                null,
+                2,
+              )}`,
+            );
+          }
+
+          // Always stream
+          requestBody.stream = true;
+
+          // Make the API call with better error handling
+          const response = await fetch(`${this.baseUrl}/messages`, {
+            method: "POST",
+            headers: {
+              "x-api-key": this.apiKey,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(requestBody),
+          });
+
+          if (!response.ok) {
+            // Get error details
+            const errorText = await response.text();
+            let errorObj: Record<string, unknown> = {};
+
+            try {
+              errorObj = JSON.parse(errorText);
+            } catch {
+              // If parsing fails, use the raw error text
+              errorObj = { message: errorText };
+            }
+
+            // Add status code to error object
+            errorObj.status = response.status;
+
+            // Check for retry-after header
+            const retryAfter = response.headers.get("retry-after");
+            if (retryAfter) {
+              errorObj.retry_after = retryAfter;
+            }
+
+            // Copy relevant headers for error analysis
+            errorObj.headers = {};
+            response.headers.forEach((value, key) => {
+              errorObj.headers[key] = value;
+            });
+
+            // Normalize error types for consistent handling
+            if (
+              response.status === 429 ||
+              (errorObj.error &&
+                typeof errorObj.error === "object" &&
+                "type" in errorObj.error &&
+                errorObj.error.type === "rate_limit_error") ||
+              (errorObj.error &&
+                typeof errorObj.error === "object" &&
+                "message" in errorObj.error &&
+                typeof errorObj.error.message === "string" &&
+                errorObj.error.message.includes("rate limit"))
+            ) {
+              errorObj.type = "rate_limit_error";
+            }
+
+            // Create a proper error with the detailed message
+            let errorMsg = "";
+            if (
+              errorObj.error &&
+              typeof errorObj.error === "object" &&
+              "message" in errorObj.error
+            ) {
+              errorMsg = String(errorObj.error.message);
+            } else if ("message" in errorObj) {
+              errorMsg = String(errorObj.message);
+            } else {
+              errorMsg = errorText;
+            }
+
+            const error = new Error(
+              `Anthropic API Error (${response.status}): ${errorMsg}`,
+            );
+
+            // Attach the original error details for debugging
+            (error as any).details = errorObj;
+
+            // Throw the error with its original message and status
+            throw error;
+          }
+
+          // Create an abort controller for the stream
+          const controller = new AbortController();
+
+          // Get the reader
+          const reader = response.body?.getReader();
+          if (!reader) {
+            throw new Error("Failed to create reader from response");
+          }
+
+          // Create an async generator to process the stream
+          const stream = (async function* () {
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let responseId = "";
+            let messageId = "";
+            let fullTextContent = ""; // Accumulate all text chunks
+
+            // Handle abort signal
+            controller.signal.addEventListener("abort", () => {
+              reader.cancel("Aborted by user").catch((err) => {
+                if (isLoggingEnabled()) {
+                  log(`Error cancelling reader: ${String(err)}`);
+                }
+              });
+            });
+
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+
+                // Process events in the buffer
+                const lines = buffer.split("\n\n");
+                buffer = lines.pop() || ""; // Keep the last line which might be incomplete
+
+                for (const line of lines) {
+                  if (!line.trim() || line.trim() === "data: [DONE]") continue;
+
+                  const dataMatch = line.match(/^data: (.+)$/m);
+                  if (!dataMatch) continue;
+
+                  try {
+                    const data = JSON.parse(dataMatch[1]);
+
+                    if (data.type === "message_start") {
+                      responseId = data.message.id;
+                      // Generate unique message ID based on the response ID
+                      messageId = `${responseId}-message`;
+
+                      // Some models send initial content in the message_start event
+                      if (
+                        data.message?.content &&
+                        data.message.content.length > 0
+                      ) {
+                        for (const content of data.message.content) {
+                          if (content.type === "text" && content.text) {
+                            fullTextContent += content.text;
+                          }
+                        }
+                      }
+                    } else if (
+                      data.type === "content_block_start" ||
+                      data.type === "content_block_delta"
+                    ) {
+                      // Accumulate content deltas instead of yielding each one
+                      const textContent =
+                        data.content_block?.text || data.delta?.text;
+                      if (textContent) {
+                        fullTextContent += textContent;
+
+                        // This is the critical part:
+                        // We need to match exactly what the agent-loop expects from OpenAI
+                        // 1. Send a delta event with ONLY the new text (not accumulated)
+                        // 2. If we don't have a stable message ID, we need to reuse the same one
+                        // 3. Delta events MUST match the exact format expected by the agent
+
+                        const stableMessageId =
+                          messageId || `message-${responseId || Date.now()}`;
+
+                        if (isLoggingEnabled()) {
+                          log(
+                            `Generating delta with new text: "${textContent}" (${textContent.length} chars)`,
+                          );
+                        }
+
+                        yield {
+                          type: "response.output_item.delta", // Match OpenAI's delta event type exactly
+                          delta: {
+                            text: textContent, // This is just the current delta
+                          },
+                          item: {
+                            id: stableMessageId, // IMPORTANT: Use a stable message ID
+                            type: "message", // Must match expected type
+                            role: "assistant", // Must be 'assistant' for proper role tracking
+                            content: [
+                              {
+                                type: "output_text", // Must be 'output_text' to match expected type
+                                text: fullTextContent, // Send the ENTIRE accumulated text
+                              },
+                            ],
+                          },
+                        };
+                      }
+                    } else if (data.type === "tool_use") {
+                      // Handle tool usage
+                      yield {
+                        type: "response.output_item.done",
+                        item: {
+                          id: data.id || `${responseId}-tool-${Date.now()}`,
+                          type: "function_call",
+                          name: data.tool_use.name,
+                          call_id: data.tool_use.id,
+                          arguments: JSON.stringify(data.tool_use.input),
+                        },
+                      };
+                    } else if (data.type === "message_stop") {
+                      // IMPORTANT: This is where we create the completed response that the agent needs
+                      // The agent loop expects:
+                      // 1. A "response.completed" event with the response ID
+                      // 2. The response ID must be set correctly for context tracking
+
+                      // Save the stableMessageId for consistency in the output
+                      const stableMessageId =
+                        messageId || `message-${responseId || Date.now()}`;
+
+                      // Check for token usage data from Anthropic
+                      // Use the provider-agnostic token tracking function
+                      if (data.message?.usage) {
+                        const usage = data.message.usage;
+                        
+                        // Track token usage in the global rate limiter
+                        trackProviderTokenUsage(
+                          "anthropic", 
+                          usage.input_tokens, 
+                          usage.output_tokens
+                        );
+                      }
+
+                      if (isLoggingEnabled()) {
+                        log(
+                          `Message complete with ID: ${responseId}, content length: ${fullTextContent.length}`,
+                        );
+                      }
+
+                      // Create the final message that will be used in the OpenAI format
+                      const finalMessage = {
+                        id: stableMessageId,
+                        type: "message",
+                        role: "assistant",
+                        content: [
+                          {
+                            type: "output_text",
+                            text: fullTextContent,
+                          },
+                        ],
+                      };
+
+                      // This is the key change: We need to capture the assistant's response
+                      // so we can maintain it in our conversation history
+                      // Get a reference to the AnthropicClient instance
+                      const provider = (stream as any)._provider;
+
+                      // If the provider has a captureAssistantResponse method, call it
+                      if (
+                        provider &&
+                        typeof provider.captureAssistantResponse === "function"
+                      ) {
+                        provider.captureAssistantResponse({
+                          role: "assistant",
+                          content: [{ type: "text", text: fullTextContent }],
+                        });
+
+                        if (isLoggingEnabled()) {
+                          log(
+                            `Captured assistant response in conversation history`,
+                          );
+                        }
+                      }
+
+                      // We need to match EXACTLY how OpenAI formats completion events
+                      // The agent-loop.ts expects this exact format to update lastResponseId
+                      yield {
+                        type: "response.completed",
+                        response: {
+                          id: responseId, // CRITICAL: This is stored as lastResponseId in agent-loop
+                          status: "completed",
+                          output: [finalMessage],
+                        },
+                      };
+
+                      if (isLoggingEnabled()) {
+                        log(
+                          `Yielded response.completed with ID: ${responseId}`,
+                        );
+                      }
+                    }
+                  } catch (e) {
+                    if (isLoggingEnabled()) {
+                      log(
+                        `Error parsing SSE event: ${
+                          e instanceof Error ? e.message : String(e)
+                        }`,
+                      );
+                    }
+                  }
+                }
+              }
+            } finally {
+              reader.releaseLock();
+            }
+          })();
+
+          // Add controller to stream for abort support
+          (stream as any).controller = controller;
+
+          // Add a reference to the provider for capturing the response
+          if (this._provider) {
+            (stream as any)._provider = this._provider;
+          }
+
+          return stream;
+        },
+        {
+          estimatedTokens,
+          // Configure timeout based on the model and complexity
+          // Claude 3.7 and more complex requests get longer timeouts
+          timeoutMs: model.includes('claude-3-7') || model.includes('claude-3.7') 
+            ? 180000 // 3 minutes for Claude 3.7 models (they may use thinking step)
+            : estimatedTokens > 100000 
+              ? 150000 // 2.5 minutes for very large context requests
+              : 120000, // 2 minutes for standard requests (same as OpenAI)
+          
+          // Dynamic backoff and retry for rate limits
+          onRateLimitEncountered: (delayMs, attempt) => {
+            // Log more detailed information for diagnostics
+            const delaySeconds = Math.round(delayMs / 1000);
+            log(
+              `Anthropic rate limit encountered: waiting ${delaySeconds}s before attempt ${attempt}`,
+            );
+            
+            if (isLoggingEnabled()) {
+              log(`Rate limit details: model=${model}, tokens=${estimatedTokens}, attempt=${attempt}`);
+            }
+
+            // Mimic OpenAI's error handling for consistency in the UI
+            // But provide more information to help the user understand the situation
+            if (attempt > 0) {
+              throw new Error(
+                `⏳ Anthropic API rate limit reached. Automatically retrying in ${delaySeconds} seconds... (Attempt ${attempt}/${maxRetries})`,
+              );
+            }
+          },
+          onFinalFailure: (error) => {
+            log(
+              `Anthropic API error after all retries: ${JSON.stringify(error)}`,
+            );
+
+            // Special handling for rate limit errors only
+            if (isRateLimitError(error)) {
+              // This will be caught by the agent loop and displayed to the user
+              const errorObj = error as Record<string, any>;
+              const status =
+                errorObj?.status ??
+                errorObj?.httpStatus ??
+                errorObj?.statusCode;
+
+              const errorDetails = [
+                `Status: ${status || "unknown"}`,
+                `Code: ${errorObj.code || "unknown"}`,
+                `Type: ${errorObj.type || "unknown"}`,
+                `Message: ${errorObj.message || "unknown"}`,
+              ].join(", ");
+
+              throw new Error(
+                `⚠️ Rate limit reached after multiple attempts. Error details: ${errorDetails}. Please try again later.`,
+              );
+            } else {
+              // For other errors, show the original error message clearly
+              const errorMessage =
+                error instanceof Error ? error.message : JSON.stringify(error);
+              throw new Error(`⚠️ Anthropic API Error: ${errorMessage}`);
+            }
+          },
+        },
+      );
+      // Return the stream directly as an async iterable
+      return response;
+    } catch (error) {
+      // Log the full error details for debugging
+      log(
+        `Error calling Anthropic API: ${
+          error instanceof Error ? error.message : JSON.stringify(error)
+        }`,
+      );
+
+      // Enhanced error handling for specific error types
+      const errorObj = error as Record<string, any>;
+      const details = errorObj.details || errorObj;
+
+      // Handle content policy violations in a user-friendly way
+      if (
+        details.type === "content_policy_violation" ||
+        details.error_type === "content_policy_violation" ||
+        details.error?.type === "content_policy_violation" ||
+        (typeof errorObj.message === "string" &&
+          errorObj.message.includes("content filter"))
+      ) {
+        throw new Error(
+          "Anthropic's content filter has blocked this request. " +
+            "Please modify your prompt and try again.",
+        );
+      }
+
+      // Handle API errors with more specific information
+      if (
+        details.status === 400 ||
+        details.status === 401 ||
+        details.status === 403
+      ) {
+        const message =
+          details.error?.message || details.message || "Unknown error";
+        throw new Error(`Anthropic API Error (${details.status}): ${message}`);
+      }
+
+      // Preserve the original error with its message
+      if (error instanceof Error) {
+        throw error;
+      } else {
+        throw new Error(`Anthropic API Error: ${JSON.stringify(error)}`);
+      }
+    }
+  }
+
+  /**
+   * Estimate token count for Anthropic models
+   * More accurate than the generic byte-based estimate
+   */
+  /**
+   * Estimate token count for Claude models
+   * Simple implementation for rate limiting purposes
+   * 
+   * @param messages Array of messages to estimate tokens for
+   * @param systemPrompt Optional system prompt
+   * @returns Estimated token count
+   */
+  private estimateTokenCount(
+    messages: Array<AnthropicMessage>,
+    systemPrompt?: string,
+  ): number {
+    // Simple character-based estimation - Anthropic will return actual usage
+    const AVG_CHARS_PER_TOKEN = 4.0;
+    const BUFFER = 1000; // Safety buffer
+    
+    // Start with a base count
+    let totalChars = 0;
+    
+    // Add system prompt length if present
+    if (systemPrompt) {
+      totalChars += systemPrompt.length;
+    }
+    
+    // Count characters in all messages
+    for (const message of messages) {
+      for (const content of message.content) {
+        if (content.type === "text" && content.text) {
+          totalChars += content.text.length;
+        }
+      }
+    }
+    
+    // Simple estimation plus buffer
+    return Math.ceil(totalChars / AVG_CHARS_PER_TOKEN) + BUFFER;
+  }
+
+  /**
+   * Configure the tools required for Codex CLI
+   * Conforms to Anthropic's current tool specification while maintaining
+   * compatibility with OpenAI's format
+   */
+  getToolsForCodex(): Array<AnthropicTool> {
+    return [
+      {
+        name: "shell",
+        description: "Runs a shell command, and returns its output.",
+        input_schema: {
+          type: "object",
+          properties: {
+            command: {
+              // OpenAI uses array format, but we need to document it differently for Anthropic
+              // The mapping function will convert string to array format when needed
+              type: "string",
+              description:
+                "The command to execute as a string. Will be split into command and arguments.",
+            },
+            workdir: {
+              type: "string",
+              description: "The working directory for the command.",
+            },
+            timeout: {
+              type: "number",
+              description:
+                "The maximum time to wait for the command to complete in milliseconds.",
+            },
+          },
+          required: ["command"],
+        },
+      },
+    ];
+  }
+}
+
+/**
+ * Factory function to create an Anthropic client instance
+ */
+export function createAnthropicClient(
+  apiKey: string,
+  options?: { baseUrl?: string; defaultModel?: string; provider?: any },
+): AnthropicClient {
+  return new AnthropicClient(apiKey, options);
+}
+
+/**
+ * Implementation for Anthropic provider that meets the ModelProviderInterface
+ */
+/**
+ * Stateful provider for the Anthropic API that maintains conversation history
+ * This is a more complex implementation than the OpenAI provider, because:
+ * 1. We need to maintain conversation history ourselves
+ * 2. We need to map between OpenAI and Anthropic formats
+ * 3. We need to handle the streaming responses correctly
+ */
+class AnthropicProvider implements ModelProviderInterface {
+  public provider = ModelProvider.ANTHROPIC;
+  private client: any;
+  private model: string;
+  private options: ProviderOptions;
+
+  // CRITICAL: We maintain our own conversation history as a workaround for Claude's context issues
+  private conversationHistory: Array<AnthropicMessage> = [];
+  private sessionId: string;
+  private lastResponseId: string = "";
+
+  constructor(options: ProviderOptions) {
+    this.model = options.model;
+    this.options = options;
+    this.sessionId = `session_${Date.now()}`;
+    // Client will be initialized lazily in sendMessage
+  }
+
+  private async initializeClient(): Promise<void> {
+    if (this.client) return;
+
+    this.client = createAnthropicClient(this.options.apiKey, {
+      baseUrl: this.options.baseUrl,
+      defaultModel: this.options.model,
+      provider: this, // Pass a reference to this provider for callbacks
+    });
+  }
+
+  // Method to capture assistant responses for conversation history
+  captureAssistantResponse(message: AnthropicMessage): void {
+    // Add the assistant's response to our conversation history
+    this.conversationHistory.push(message);
+
+    // Update our internal state
+    if (this.lastResponseId) {
+      if (isLoggingEnabled()) {
+        const preview = message.content[0]?.text?.substring(0, 25) || "";
+        log(`Added assistant response to history: "${preview}..."`);
+        log(
+          `Updated conversation history to ${this.conversationHistory.length} messages`,
+        );
+      }
+    }
+  }
+
+  // Helper to print out current conversation state for debugging
+  private debugConversationState(): void {
+    if (!isLoggingEnabled()) return;
+
+    log("\n======== CONVERSATION STATE ========");
+    log(`Session ID: ${this.sessionId}`);
+    log(`Last Response ID: ${this.lastResponseId}`);
+    log(`History length: ${this.conversationHistory.length} messages`);
+
+    if (this.conversationHistory.length > 0) {
+      log("Conversation flow:");
+      this.conversationHistory.forEach((msg, idx) => {
+        const preview = msg.content[0]?.text?.substring(0, 25) || "";
+        log(`  ${idx + 1}. [${msg.role}] "${preview}..."`);
+      });
+    }
+    log("====================================\n");
+  }
+
+  // Main method to send a message to Anthropic API
+  async sendMessage(
+    input: Array<ResponseInputItem>,
+    options: {
+      reasoning?: unknown;
+      system?: string;
+      temperature?: number;
+      previousResponseId?: string;
+      conversationId?: string;
+      thinking?: { budgetTokens: number };
+    },
+  ): Promise<AsyncIterable<any>> {
+    try {
+      // Make sure client is initialized
+      await this.initializeClient();
+
+      // Maintain internal state for conversation tracking
+      if (options.conversationId) {
+        this.sessionId = options.conversationId;
+      }
+
+      if (options.previousResponseId) {
+        this.lastResponseId = options.previousResponseId;
+      }
+
+      if (isLoggingEnabled()) {
+        log(`\n============= NEW REQUEST =============`);
+        log(`Model: ${this.model}`);
+        log(`Input size: ${input.length} items`);
+        log(
+          `System prompt: ${
+            options.system ? `${options.system.length} chars` : "none"
+          }`,
+        );
+        this.debugConversationState();
+      }
+
+      // Process new input and add to conversation
+      const { messages, toolResults } = mapOpenAIInputToAnthropic(input);
+
+      // Add new user messages to our history
+      // Only keep the most recent messages to avoid hitting context limits
+      const MAX_HISTORY = 20;
+
+      // Add all new messages to history
+      for (const msg of messages) {
+        // Skip system messages - we'll use the latest system prompt
+        if (msg.role === "system") continue;
+
+        // Add user and assistant messages to history
+        this.conversationHistory.push(msg);
+
+        if (isLoggingEnabled()) {
+          const preview = msg.content[0]?.text?.substring(0, 25) || "";
+          log(`Added to history: [${msg.role}] "${preview}..."`);
+        }
+      }
+
+      // Trim history if it gets too long (keep most recent messages)
+      if (this.conversationHistory.length > MAX_HISTORY) {
+        const excessMessages = this.conversationHistory.length - MAX_HISTORY;
+        this.conversationHistory =
+          this.conversationHistory.slice(excessMessages);
+
+        if (isLoggingEnabled()) {
+          log(`Trimmed ${excessMessages} old messages from history`);
+        }
+      }
+
+      // Now prepare the actual request with our maintained history
+      if (isLoggingEnabled()) {
+        log(
+          `\nPreparing API request with ${this.conversationHistory.length} history messages`,
+        );
+        this.debugConversationState();
+      }
+
+      // Force temperature to 1.0 for thinking-enabled models (Claude requirement)
+      const temperature = options.thinking ? 1.0 : options.temperature || 0.7;
+
+      if (isLoggingEnabled()) {
+        log(`Sending request to Anthropic API`);
+        log(`- Model: ${this.model}`);
+        log(`- Temperature: ${temperature}`);
+        log(`- System prompt: ${options.system ? "yes" : "no"}`);
+        log(`- Thinking: ${options.thinking ? "enabled" : "disabled"}`);
+        log(`- History messages: ${this.conversationHistory.length}`);
+        log(`- Tool results: ${toolResults.length}`);
+        log(`============= END REQUEST INFO =============\n`);
+      }
+
+      // Call Anthropic with our maintained conversation history
+      const response = await this.client.sendMessage(
+        // Use our maintained history instead of just this turn's input
+        this.conversationHistory,
+        {
+          model: this.model,
+          system: options.system,
+          temperature: temperature,
+          // Pass session ID for consistency
+          conversationId: this.sessionId,
+          previousResponseId: this.lastResponseId,
+          // Always include shell tool
+          tools: this.client.getToolsForCodex(),
+          // Pass thinking config
+          thinking: options.thinking,
+          // Always stream
+          stream: true,
+          // Pass tool results
+          toolResults: toolResults,
+        },
+      );
+
+      return response;
+    } catch (error) {
+      if (isLoggingEnabled()) {
+        log(
+          `Error in Anthropic provider: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * Factory function for creating Anthropic provider instances
+ */
+export async function createAnthropicProvider(
+  options: ProviderOptions,
+): Promise<ModelProviderInterface> {
+  return new AnthropicProvider(options);
+}
+
+// Register this provider with the registry
+providerRegistry.registerProvider(
+  ModelProvider.ANTHROPIC,
+  createAnthropicProvider,
+  [/^claude/, /anthropic/], // Model name patterns for Anthropic
+);

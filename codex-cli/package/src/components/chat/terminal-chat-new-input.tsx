@@ -421,34 +421,6 @@ export default function TerminalChatInput({
   );
 }
 
-// Function to get current token count from the rate limiter
-function getCurrentTokenCount(): number {
-  try {
-    // Import the rate limiter dynamically to avoid circular dependencies
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const rateLimiter = require("../../utils/rate-limiter.js").globalRateLimiter;
-    
-    // Try Anthropic first, then OpenAI if no Anthropic data
-    const providers = ["anthropic", "openai"];
-    
-    for (const provider of providers) {
-      // Access the internal usageTrackers map to get token count
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const tracker = (rateLimiter as any).usageTrackers?.get(provider);
-      if (tracker && typeof tracker.tokenCount === 'number') {
-        return tracker.tokenCount;
-      }
-    }
-  } catch (e) {
-    // Silently fail if there's an error
-    if (isLoggingEnabled()) {
-      log(`Error getting token count: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  
-  return 0;
-}
-
 function TerminalChatInputThinking({
   onInterrupt,
   active,
@@ -459,46 +431,37 @@ function TerminalChatInputThinking({
   thinkingSeconds: number;
 }) {
   const [awaitingConfirm, setAwaitingConfirm] = useState(false);
-  const [tokenCount, setTokenCount] = useState(0);
   const [dots, setDots] = useState("");
-
-  // Update token count periodically
-  useInterval(() => {
-    if (active) {
-      setTokenCount(getCurrentTokenCount());
-    }
-  }, 1000);
 
   // Animate ellipsis
   useInterval(() => {
     setDots((prev) => (prev.length < 3 ? prev + "." : ""));
   }, 500);
 
-  // Elegant animation frames for a more premium look
-  const spinnerFrames = [
-    "◜", "◠", "◝", "◞", "◡", "◟"
+  // Spinner frames with seconds embedded
+  const ballFrames = [
+    "( ●    )",
+    "(  ●   )",
+    "(   ●  )",
+    "(    ● )",
+    "(     ●)",
+    "(    ● )",
+    "(   ●  )",
+    "(  ●   )",
+    "( ●    )",
+    "(●     )",
   ];
   const [frame, setFrame] = useState(0);
 
   useInterval(() => {
-    setFrame((idx) => (idx + 1) % spinnerFrames.length);
-  }, 100);
+    setFrame((idx) => (idx + 1) % ballFrames.length);
+  }, 80);
 
-  // Format token count with commas for better readability
-  const formattedTokenCount = tokenCount.toLocaleString();
-  
-  // Calculate percentage of context window used (assuming a typical 100k token window)
-  const contextSize = 100000;
-  const percentUsed = Math.min(100, Math.ceil((tokenCount / contextSize) * 100));
-  
-  // Create a gradient color based on token usage
-  const getTokenColor = () => {
-    if (percentUsed < 50) return 'green';
-    if (percentUsed < 80) return 'yellow';
-    return 'red';
-  };
-  
-  const tokenColor = getTokenColor();
+  const frameTemplate = ballFrames[frame] ?? ballFrames[0];
+  const frameWithSeconds = (frameTemplate as string).replace(
+    "●",
+    `●${thinkingSeconds}s`,
+  );
 
   // ---------------------------------------------------------------------
   // Raw stdin listener to catch the case where the terminal delivers two
@@ -571,44 +534,19 @@ function TerminalChatInputThinking({
     { isActive: active },
   );
 
-  // Generate progress bar
-  const progressBarLength = 10;
-  const filledBars = Math.max(1, Math.floor((percentUsed / 100) * progressBarLength));
-  const emptyBars = progressBarLength - filledBars;
-  
-  // Current spinner frame
-  const spinnerChar = spinnerFrames[frame];
-  
   return (
     <Box flexDirection="column" gap={1}>
-      <Box gap={1} flexDirection="column">
-        <Box>
-          <Text>
-            <Text color="cyan">{spinnerChar} </Text>
-            <Text bold color="magenta">Thinking{dots}</Text>
-            <Text dimColor> • {thinkingSeconds}s elapsed</Text>
-          </Text>
-        </Box>
-        
-        <Box>
-          <Text>
-            <Text color="cyan">⟨</Text>
-            <Text bold>Tokens: {formattedTokenCount}</Text>
-            <Text color="cyan">⟩</Text>
-            {' '}
-            <Text color="gray">┃</Text>
-            <Text color={tokenColor}>{'█'.repeat(filledBars)}</Text>
-            <Text dimColor>{'░'.repeat(emptyBars)}</Text>
-            <Text color="gray">┃</Text>
-            {' '}
-            <Text dimColor>{percentUsed}%</Text>
-          </Text>
-        </Box>
+      <Box gap={2}>
+        <Text>{frameWithSeconds}</Text>
+        <Text>
+          Thinking
+          {dots}
+        </Text>
       </Box>
-      
       {awaitingConfirm && (
         <Text dimColor>
-          Press <Text bold>Esc</Text> again to interrupt and enter a new instruction
+          Press <Text bold>Esc</Text> again to interrupt and enter a new
+          instruction
         </Text>
       )}
     </Box>

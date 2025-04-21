@@ -1,4 +1,3 @@
-import type { MultilineTextEditorHandle } from "./multiline-editor";
 import type { ReviewDecision } from "../../utils/agent/review.js";
 import type { HistoryEntry } from "../../utils/storage/command-history.js";
 import type {
@@ -6,7 +5,6 @@ import type {
   ResponseItem,
 } from "openai/resources/responses/responses.mjs";
 
-import MultilineTextEditor from "./multiline-editor";
 import { TerminalChatCommandReview } from "./terminal-chat-command-review.js";
 import { log, isLoggingEnabled } from "../../utils/agent/log.js";
 import { loadConfig } from "../../utils/config.js";
@@ -17,6 +15,7 @@ import {
   addToHistory,
 } from "../../utils/storage/command-history.js";
 import { clearTerminal, onExit } from "../../utils/terminal.js";
+import TextInput from "../vendor/ink-text-input.js";
 import { Box, Text, useApp, useInput, useStdin } from "ink";
 import { fileURLToPath } from "node:url";
 import React, { useCallback, useState, Fragment, useEffect } from "react";
@@ -28,18 +27,8 @@ const suggestions = [
   "are there any bugs in my code?",
 ];
 
-const typeHelpText = `ctrl+c to exit | "/clear" to reset context | "/help" for commands | ↑↓ to recall history | ctrl+x to open external editor | enter to send`;
-
-// Enable verbose logging for the history‑navigation logic when the
-// DEBUG_TCI environment variable is truthy.  The traces help while debugging
-// unit‑test failures but remain silent in production.
-const DEBUG_HIST =
-  process.env["DEBUG_TCI"] === "1" || process.env["DEBUG_TCI"] === "true";
-
-// Placeholder for potential dynamic prompts – currently not used.
-
 export default function TerminalChatInput({
-  isNew: _isNew,
+  isNew,
   loading,
   submitInput,
   confirmationPrompt,
@@ -52,9 +41,11 @@ export default function TerminalChatInput({
   openModelOverlay,
   openApprovalOverlay,
   openHelpOverlay,
+  onCompact,
   interruptAgent,
   active,
   thinkingSeconds,
+  items = [],
 }: {
   isNew: boolean;
   loading: boolean;
@@ -72,9 +63,12 @@ export default function TerminalChatInput({
   openModelOverlay: () => void;
   openApprovalOverlay: () => void;
   openHelpOverlay: () => void;
+  onCompact: () => void;
   interruptAgent: () => void;
   active: boolean;
   thinkingSeconds: number;
+  // New: current conversation items so we can include them in bug reports
+  items?: Array<ResponseItem>;
 }): React.ReactElement {
   const app = useApp();
   const [selectedSuggestion, setSelectedSuggestion] = useState<number>(0);
@@ -82,10 +76,6 @@ export default function TerminalChatInput({
   const [history, setHistory] = useState<Array<HistoryEntry>>([]);
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [draftInput, setDraftInput] = useState<string>("");
-  // Multiline text editor is now the default input mode.  We keep an
-  // incremental `editorKey` so that we can force‑remount the component and
-  // thus reset its internal buffer after each successful submit.
-  const [editorKey, setEditorKey] = useState(0);
 
   // Load command history on component mount
   useEffect(() => {
@@ -97,46 +87,13 @@ export default function TerminalChatInput({
     loadHistory();
   }, []);
 
-  // Imperative handle from the multiline editor so we can query caret position
-  const editorRef = React.useRef<MultilineTextEditorHandle | null>(null);
-
-  // Track the caret row across keystrokes so we can tell whether the cursor
-  // was *already* on the first/last line before the current key event.  This
-  // lets us distinguish between a normal vertical navigation (e.g. moving
-  // from row 1 → row 0 inside a multi‑line draft) and an attempt to navigate
-  // the chat history (pressing ↑ again while already at row 0).
-  const prevCursorRow = React.useRef<number | null>(null);
-
   useInput(
     (_input, _key) => {
       if (!confirmationPrompt && !loading) {
         if (_key.upArrow) {
-          if (DEBUG_HIST) {
-            // eslint-disable-next-line no-console
-            console.log("[TCI] upArrow", {
-              historyIndex,
-              input,
-              cursorRow: editorRef.current?.getRow?.(),
-            });
-          }
-          // Only recall history when the caret was *already* on the very first
-          // row *before* this key‑press.  That means the user pressed ↑ while
-          // the cursor sat at the top – mirroring how shells like Bash/zsh
-          // enter history navigation.  When the caret starts on a lower line
-          // the first ↑ should merely move it up one row; only a subsequent
-          // press (when we are *still* at row 0) should trigger the recall.
-
-          const cursorRow = editorRef.current?.getRow?.() ?? 0;
-          const wasAtFirstRow = (prevCursorRow.current ?? cursorRow) === 0;
-
-          if (history.length > 0 && cursorRow === 0 && wasAtFirstRow) {
+          if (history.length > 0) {
             if (historyIndex == null) {
-              const currentDraft = editorRef.current?.getText?.() ?? input;
-              setDraftInput(currentDraft);
-              if (DEBUG_HIST) {
-                // eslint-disable-next-line no-console
-                console.log("[TCI] store draft", JSON.stringify(currentDraft));
-              }
+              setDraftInput(input);
             }
 
             let newIndex: number;
@@ -147,39 +104,28 @@ export default function TerminalChatInput({
             }
             setHistoryIndex(newIndex);
             setInput(history[newIndex]?.command ?? "");
-            // Re‑mount the editor so it picks up the new initialText.
-            setEditorKey((k) => k + 1);
-            return; // we handled the key
           }
-          // Otherwise let the event propagate so the editor moves the caret.
+          return;
         }
 
         if (_key.downArrow) {
-          if (DEBUG_HIST) {
-            // eslint-disable-next-line no-console
-            console.log("[TCI] downArrow", { historyIndex, draftInput, input });
+          if (historyIndex == null) {
+            return;
           }
-          // Only move forward in history when we're already *in* history mode
-          // AND the caret sits on the last line of the buffer (so ↓ within a
-          // multi‑line draft simply moves the caret down).
-          if (historyIndex != null && editorRef.current?.isCursorAtLastRow()) {
-            const newIndex = historyIndex + 1;
-            if (newIndex >= history.length) {
-              setHistoryIndex(null);
-              setInput(draftInput);
-              setEditorKey((k) => k + 1);
-            } else {
-              setHistoryIndex(newIndex);
-              setInput(history[newIndex]?.command ?? "");
-              setEditorKey((k) => k + 1);
-            }
-            return; // handled
+
+          const newIndex = historyIndex + 1;
+          if (newIndex >= history.length) {
+            setHistoryIndex(null);
+            setInput(draftInput);
+          } else {
+            setHistoryIndex(newIndex);
+            setInput(history[newIndex]?.command ?? "");
           }
-          // Otherwise let it propagate.
+          return;
         }
       }
 
-      if (input.trim() === "") {
+      if (input.trim() === "" && isNew) {
         if (_key.tab) {
           setSelectedSuggestion(
             (s) => (s + (_key.shift ? -1 : 1)) % (suggestions.length + 1),
@@ -203,10 +149,6 @@ export default function TerminalChatInput({
           process.exit(0);
         }, 60);
       }
-
-      // Update the cached cursor position *after* we've potentially handled
-      // the key so that the next event has the correct "previous" reference.
-      prevCursorRow.current = editorRef.current?.getRow?.() ?? null;
     },
     { isActive: active },
   );
@@ -227,6 +169,12 @@ export default function TerminalChatInput({
       if (inputValue === "/help") {
         setInput("");
         openHelpOverlay();
+        return;
+      }
+
+      if (inputValue === "/compact") {
+        setInput("");
+        onCompact();
         return;
       }
 
@@ -296,15 +244,126 @@ export default function TerminalChatInput({
         );
 
         return;
+      } else if (inputValue === "/bug") {
+        // Generate a GitHub bug report URL pre‑filled with session details
+        setInput("");
+
+        try {
+          // Dynamically import dependencies to avoid unnecessary bundle size
+          const [{ default: open }, os] = await Promise.all([
+            import("open"),
+            import("node:os"),
+          ]);
+
+          // Lazy import CLI_VERSION to avoid circular deps
+          const { CLI_VERSION } = await import("../../utils/session.js");
+
+          const { buildBugReportUrl } = await import(
+            "../../utils/bug-report.js"
+          );
+
+          const url = buildBugReportUrl({
+            items: items ?? [],
+            cliVersion: CLI_VERSION,
+            model: loadConfig().model ?? "unknown",
+            platform: [os.platform(), os.arch(), os.release()]
+              .map((s) => `\`${s}\``)
+              .join(" | "),
+          });
+
+          // Open the URL in the user's default browser
+          await open(url, { wait: false });
+
+          // Inform the user in the chat history
+          setItems((prev) => [
+            ...prev,
+            {
+              id: `bugreport-${Date.now()}`,
+              type: "message",
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: "📋 Opened browser to file a bug report. Please include any context that might help us fix the issue!",
+                },
+              ],
+            },
+          ]);
+        } catch (error) {
+          // If anything went wrong, notify the user
+          setItems((prev) => [
+            ...prev,
+            {
+              id: `bugreport-error-${Date.now()}`,
+              type: "message",
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: `⚠️ Failed to create bug report URL: ${error}`,
+                },
+              ],
+            },
+          ]);
+        }
+
+        return;
+      } else if (inputValue.startsWith("/")) {
+        // Handle invalid/unrecognized commands.
+        // Only single-word inputs starting with '/' (e.g., /command) that are not recognized are caught here.
+        // Any other input, including those starting with '/' but containing spaces
+        // (e.g., "/command arg"), will fall through and be treated as a regular prompt.
+        const trimmed = inputValue.trim();
+
+        if (/^\/\S+$/.test(trimmed)) {
+          setInput("");
+          setItems((prev) => [
+            ...prev,
+            {
+              id: `invalidcommand-${Date.now()}`,
+              type: "message",
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: `Invalid command "${trimmed}". Use /help to retrieve the list of commands.`,
+                },
+              ],
+            },
+          ]);
+
+          return;
+        }
       }
 
+      // detect image file paths for dynamic inclusion
       const images: Array<string> = [];
-      const text = inputValue
-        .replace(/!\[[^\]]*?\]\(([^)]+)\)/g, (_m, p1: string) => {
+      let text = inputValue;
+      // markdown-style image syntax: ![alt](path)
+      text = text.replace(/!\[[^\]]*?\]\(([^)]+)\)/g, (_m, p1: string) => {
+        images.push(p1.startsWith("file://") ? fileURLToPath(p1) : p1);
+        return "";
+      });
+      // quoted file paths ending with common image extensions (e.g. '/path/to/img.png')
+      text = text.replace(
+        /['"]([^'"]+?\.(?:png|jpe?g|gif|bmp|webp|svg))['"]/gi,
+        (_m, p1: string) => {
           images.push(p1.startsWith("file://") ? fileURLToPath(p1) : p1);
           return "";
-        })
-        .trim();
+        },
+      );
+      // bare file paths ending with common image extensions
+      text = text.replace(
+        // eslint-disable-next-line no-useless-escape
+        /\b(?:\.[\/\\]|[\/\\]|[A-Za-z]:[\/\\])?[\w-]+(?:[\/\\][\w-]+)*\.(?:png|jpe?g|gif|bmp|webp|svg)\b/gi,
+        (match: string) => {
+          images.push(
+            match.startsWith("file://") ? fileURLToPath(match) : match,
+          );
+          return "";
+        },
+      );
+      text = text.trim();
 
       const inputItem = await createInputItem(text, images);
       submitInput([inputItem]);
@@ -338,6 +397,8 @@ export default function TerminalChatInput({
       openModelOverlay,
       openHelpOverlay,
       history, // Add history to the dependency array
+      onCompact,
+      items,
     ],
   );
 
@@ -353,100 +414,82 @@ export default function TerminalChatInput({
 
   return (
     <Box flexDirection="column">
-      {loading ? (
-        <Box borderStyle="round">
+      <Box borderStyle="round">
+        {loading ? (
           <TerminalChatInputThinking
             onInterrupt={interruptAgent}
             active={active}
             thinkingSeconds={thinkingSeconds}
           />
-        </Box>
-      ) : (
-        <>
-          <Box borderStyle="round">
-            <MultilineTextEditor
-              ref={editorRef}
-              onChange={(txt: string) => setInput(txt)}
-              key={editorKey}
-              initialText={input}
-              height={8}
+        ) : (
+          <Box paddingX={1}>
+            <TextInput
               focus={active}
-              onSubmit={(txt) => {
-                onSubmit(txt);
-
-                setEditorKey((k) => k + 1);
-
-                setInput("");
-                setHistoryIndex(null);
-                setDraftInput("");
+              placeholder={
+                selectedSuggestion
+                  ? `"${suggestions[selectedSuggestion - 1]}"`
+                  : "send a message" +
+                    (isNew ? " or press tab to select a suggestion" : "")
+              }
+              showCursor
+              value={input}
+              onChange={(value) => {
+                setDraftInput(value);
+                if (historyIndex != null) {
+                  setHistoryIndex(null);
+                }
+                setInput(value);
               }}
+              onSubmit={onSubmit}
             />
           </Box>
-          <Box paddingX={2} marginBottom={1}>
-            <Text dimColor>
-              {!input ? (
+        )}
+      </Box>
+      <Box paddingX={2} marginBottom={1}>
+        <Text dimColor>
+          {isNew && !input ? (
+            <>
+              try:{" "}
+              {suggestions.map((m, key) => (
+                <Fragment key={key}>
+                  {key !== 0 ? " | " : ""}
+                  <Text
+                    backgroundColor={
+                      key + 1 === selectedSuggestion ? "blackBright" : ""
+                    }
+                  >
+                    {m}
+                  </Text>
+                </Fragment>
+              ))}
+            </>
+          ) : (
+            <>
+              send q or ctrl+c to exit | send "/clear" to reset | send "/help"
+              for commands | press enter to send
+              {contextLeftPercent > 25 && (
                 <>
-                  try:{" "}
-                  {suggestions.map((m, key) => (
-                    <Fragment key={key}>
-                      {key !== 0 ? " | " : ""}
-                      <Text
-                        backgroundColor={
-                          key + 1 === selectedSuggestion ? "blackBright" : ""
-                        }
-                      >
-                        {m}
-                      </Text>
-                    </Fragment>
-                  ))}
-                </>
-              ) : (
-                <>
-                  {typeHelpText}
-                  {contextLeftPercent < 25 && (
-                    <>
-                      {" — "}
-                      <Text color="red">
-                        {Math.round(contextLeftPercent)}% context left
-                      </Text>
-                    </>
-                  )}
+                  {" — "}
+                  <Text color={contextLeftPercent > 40 ? "green" : "yellow"}>
+                    {Math.round(contextLeftPercent)}% context left
+                  </Text>
                 </>
               )}
-            </Text>
-          </Box>
-        </>
-      )}
+              {contextLeftPercent <= 25 && (
+                <>
+                  {" — "}
+                  <Text color="red">
+                    {Math.round(contextLeftPercent)}% context left — send
+                    "/compact" to condense context
+                  </Text>
+                </>
+              )}
+            </>
+          )}
+        </Text>
+      </Box>
     </Box>
   );
-}
-
-// Function to get current token count from the rate limiter
-function getCurrentTokenCount(): number {
-  try {
-    // Import the rate limiter dynamically to avoid circular dependencies
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const rateLimiter = require("../../utils/rate-limiter.js").globalRateLimiter;
-    
-    // Try Anthropic first, then OpenAI if no Anthropic data
-    const providers = ["anthropic", "openai"];
-    
-    for (const provider of providers) {
-      // Access the internal usageTrackers map to get token count
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const tracker = (rateLimiter as any).usageTrackers?.get(provider);
-      if (tracker && typeof tracker.tokenCount === 'number') {
-        return tracker.tokenCount;
-      }
-    }
-  } catch (e) {
-    // Silently fail if there's an error
-    if (isLoggingEnabled()) {
-      log(`Error getting token count: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  
-  return 0;
 }
 
 function TerminalChatInputThinking({
@@ -459,46 +502,35 @@ function TerminalChatInputThinking({
   thinkingSeconds: number;
 }) {
   const [awaitingConfirm, setAwaitingConfirm] = useState(false);
-  const [tokenCount, setTokenCount] = useState(0);
   const [dots, setDots] = useState("");
-
-  // Update token count periodically
-  useInterval(() => {
-    if (active) {
-      setTokenCount(getCurrentTokenCount());
-    }
-  }, 1000);
 
   // Animate ellipsis
   useInterval(() => {
     setDots((prev) => (prev.length < 3 ? prev + "." : ""));
   }, 500);
 
-  // Elegant animation frames for a more premium look
-  const spinnerFrames = [
-    "◜", "◠", "◝", "◞", "◡", "◟"
+  // Spinner frames with embedded seconds
+  const ballFrames = [
+    "( ●    )",
+    "(  ●   )",
+    "(   ●  )",
+    "(    ● )",
+    "(     ●)",
+    "(    ● )",
+    "(   ●  )",
+    "(  ●   )",
+    "( ●    )",
+    "(●     )",
   ];
   const [frame, setFrame] = useState(0);
 
   useInterval(() => {
-    setFrame((idx) => (idx + 1) % spinnerFrames.length);
-  }, 100);
+    setFrame((idx) => (idx + 1) % ballFrames.length);
+  }, 80);
 
-  // Format token count with commas for better readability
-  const formattedTokenCount = tokenCount.toLocaleString();
-  
-  // Calculate percentage of context window used (assuming a typical 100k token window)
-  const contextSize = 100000;
-  const percentUsed = Math.min(100, Math.ceil((tokenCount / contextSize) * 100));
-  
-  // Create a gradient color based on token usage
-  const getTokenColor = () => {
-    if (percentUsed < 50) return 'green';
-    if (percentUsed < 80) return 'yellow';
-    return 'red';
-  };
-  
-  const tokenColor = getTokenColor();
+  // Keep the elapsed‑seconds text fixed while the ball animation moves.
+  const frameTemplate = ballFrames[frame] ?? ballFrames[0];
+  const frameWithSeconds = `${frameTemplate} ${thinkingSeconds}s`;
 
   // ---------------------------------------------------------------------
   // Raw stdin listener to catch the case where the terminal delivers two
@@ -546,8 +578,11 @@ function TerminalChatInputThinking({
     };
   }, [stdin, awaitingConfirm, onInterrupt, active, setRawMode]);
 
-  // Elapsed time provided via props – no local interval needed.
+  // No local timer: the parent component supplies the elapsed time via props.
 
+  // Listen for the escape key to allow the user to interrupt the current
+  // operation. We require two presses within a short window (1.5s) to avoid
+  // accidental cancellations.
   useInput(
     (_input, key) => {
       if (!key.escape) {
@@ -571,44 +606,19 @@ function TerminalChatInputThinking({
     { isActive: active },
   );
 
-  // Generate progress bar
-  const progressBarLength = 10;
-  const filledBars = Math.max(1, Math.floor((percentUsed / 100) * progressBarLength));
-  const emptyBars = progressBarLength - filledBars;
-  
-  // Current spinner frame
-  const spinnerChar = spinnerFrames[frame];
-  
   return (
     <Box flexDirection="column" gap={1}>
-      <Box gap={1} flexDirection="column">
-        <Box>
-          <Text>
-            <Text color="cyan">{spinnerChar} </Text>
-            <Text bold color="magenta">Thinking{dots}</Text>
-            <Text dimColor> • {thinkingSeconds}s elapsed</Text>
-          </Text>
-        </Box>
-        
-        <Box>
-          <Text>
-            <Text color="cyan">⟨</Text>
-            <Text bold>Tokens: {formattedTokenCount}</Text>
-            <Text color="cyan">⟩</Text>
-            {' '}
-            <Text color="gray">┃</Text>
-            <Text color={tokenColor}>{'█'.repeat(filledBars)}</Text>
-            <Text dimColor>{'░'.repeat(emptyBars)}</Text>
-            <Text color="gray">┃</Text>
-            {' '}
-            <Text dimColor>{percentUsed}%</Text>
-          </Text>
-        </Box>
+      <Box gap={2}>
+        <Text>{frameWithSeconds}</Text>
+        <Text>
+          Thinking
+          {dots}
+        </Text>
       </Box>
-      
       {awaitingConfirm && (
         <Text dimColor>
-          Press <Text bold>Esc</Text> again to interrupt and enter a new instruction
+          Press <Text bold>Esc</Text> again to interrupt and enter a new
+          instruction
         </Text>
       )}
     </Box>
