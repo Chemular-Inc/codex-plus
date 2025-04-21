@@ -10,6 +10,7 @@ import { log, isLoggingEnabled } from "../../utils/agent/log.js";
 import { loadConfig } from "../../utils/config.js";
 import { createInputItem } from "../../utils/input-utils.js";
 import { setSessionId } from "../../utils/session.js";
+import { getCurrentTokenCount } from "../../utils/model-providers/provider-interface.js";
 import {
   loadCommandHistory,
   addToHistory,
@@ -492,33 +493,6 @@ export default function TerminalChatInput({
   );
 }
 
-// Function to get current token count from the rate limiter
-function getCurrentTokenCount(): number {
-  try {
-    // Import the rate limiter dynamically to avoid circular dependencies
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const rateLimiter = require("../../utils/rate-limiter.js").globalRateLimiter;
-    
-    // Try Anthropic first, then OpenAI if no Anthropic data
-    const providers = ["anthropic", "openai"];
-    
-    for (const provider of providers) {
-      // Access the internal usageTrackers map to get token count
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const tracker = (rateLimiter as any).usageTrackers?.get(provider);
-      if (tracker && typeof tracker.tokenCount === 'number') {
-        return tracker.tokenCount;
-      }
-    }
-  } catch (e) {
-    // Silently fail if there's an error
-    if (isLoggingEnabled()) {
-      log(`Error getting token count: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  
-  return 0;
-}
 
 function TerminalChatInputThinking({
   onInterrupt,
