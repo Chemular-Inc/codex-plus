@@ -1,9 +1,12 @@
 {
-  "name": "@j_hanlon/codex-plus",
-  "version": "0.1.3-beta.27",
+  "name": "codex-plus",
+  "version": "1.0.0-beta.25",
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "Apache-2.0",
   "bin": {
-    "codex-plus": "bin/codex.js"
+    "codex-plus": "bin/codex-plus.js"
   },
   "type": "module",
   "engines": {
@@ -34,7 +37,6 @@
     "src"
   ],
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
     "@inkjs/ui": "^2.0.0",
     "chalk": "^5.2.0",
     "diff": "^7.0.0",

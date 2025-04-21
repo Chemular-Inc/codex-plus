@@ -6,18 +6,25 @@ import type {
   ResponseInputItem,
   ResponseItem,
 } from "openai/resources/responses/responses.mjs";
+import type { Reasoning } from "openai/resources.mjs";
 
 import { log, isLoggingEnabled } from "./log.js";
-import { ModelAdapter } from "../model-providers/model-adapter.js";
-// Keep using the adapter approach
+import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
 import {
+  ORIGIN,
+  CLI_VERSION,
   getSessionId,
   setCurrentModel,
   setSessionId,
 } from "../session.js";
 import { handleExecCommand } from "./handle-exec-command.js";
 import { randomUUID } from "node:crypto";
+import OpenAI, { APIConnectionTimeoutError } from "openai";
+import { ModelProvider, ModelProviderInterface, providerRegistry, detectProviderFromModel } from "../model-providers/index.js";
+
+// Add support for rate limiter
+import { executeWithRateLimiting } from "../rate-limiter.js";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
@@ -32,8 +39,7 @@ export type CommandConfirmation = {
   explanation?: string;
 };
 
-// This was a global, which could cause issues with multiple instances
-// Each agent loop instance should track its own processed responses
+const alreadyProcessedResponses = new Set();
 
 type AgentLoopParams = {
   model: string;
@@ -60,11 +66,18 @@ export class AgentLoop {
   private approvalPolicy: ApprovalPolicy;
   private config: AppConfig;
   private additionalWritableRoots: ReadonlyArray<string>;
+  private modelProvider: ModelProvider;
 
-  // Model adapter to handle provider-specific interactions
-  private modelAdapter: ModelAdapter;
+  // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
+  // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
+  // type to avoid sprinkling `any` across the implementation while still allowing paths where
+  // the OpenAI SDK types may not perfectly match. The `typeof OpenAI` pattern captures the
+  // instance shape without resorting to `any`.
+  private oai: OpenAI;
   
-  // Keep using the adapter approach
+  // The provider instance that handles model-specific implementations
+  private provider: ModelProviderInterface | null = null;
+  private providerInitialized: Promise<void>;
 
   private onItem: (item: ResponseItem) => void;
   private onLoading: (loading: boolean) => void;
@@ -80,8 +93,6 @@ export class AgentLoop {
    * to interrupt the current task (e.g. via the escape hot‑key).
    */
   private currentStream: unknown | null = null;
-  /** Track responses that have already been processed to avoid duplicates */
-  private alreadyProcessedResponses = new Set<string>();
   /** Incremented with every call to `run()`. Allows us to ignore stray events
    * from streams that belong to a previous run which might still be emitting
    * after the user has canceled and issued a new command. */
@@ -192,6 +203,32 @@ export class AgentLoop {
 
     this.cancel();
   }
+  
+  /**
+   * Initialize the provider instance
+   * This is called lazily when needed
+   */
+  private async initializeProvider(): Promise<void> {
+    if (this.provider) {
+      return; // Already initialized
+    }
+    
+    try {
+      if (isLoggingEnabled()) {
+        log(`Initializing provider for model ${this.model} (${this.modelProvider})`);
+      }
+      
+      // Get the appropriate provider implementation from the registry
+      this.provider = await providerRegistry.createProviderFromConfig(this.config);
+      
+      if (isLoggingEnabled()) {
+        log(`Provider initialized successfully: ${this.provider.provider}`);
+      }
+    } catch (error) {
+      log(`Error initializing provider: ${error instanceof Error ? error.message : String(error)}`);
+      throw error; // Re-throw to notify caller
+    }
+  }
 
   public sessionId: string;
   /*
@@ -221,6 +258,9 @@ export class AgentLoop {
     this.instructions = instructions;
     this.approvalPolicy = approvalPolicy;
 
+    // Detect provider from model name
+    this.modelProvider = detectProviderFromModel(model);
+
     // If no `config` has been provided we derive a minimal stub so that the
     // rest of the implementation can rely on `this.config` always being a
     // defined object.  We purposefully copy over the `model` and
@@ -239,13 +279,32 @@ export class AgentLoop {
     this.onLastResponseId = onLastResponseId;
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
     
-    // Initialize the model adapter
-    this.modelAdapter = new ModelAdapter(model, this.sessionId, this.config);
-    
-    // Keep using the adapter approach
+    // Initialize both the OpenAI client for backward compatibility
+    // and our provider architecture for the future
+    const timeoutMs = OPENAI_TIMEOUT_MS;
+    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
+    this.oai = new OpenAI({
+      // The OpenAI JS SDK only requires `apiKey` when making requests against
+      // the official API.  When running unit‑tests we stub out all network
+      // calls so an undefined key is perfectly fine.  We therefore only set
+      // the property if we actually have a value to avoid triggering runtime
+      // errors inside the SDK (it validates that `apiKey` is a non‑empty
+      // string when the field is present).
+      ...(apiKey ? { apiKey } : {}),
+      baseURL: OPENAI_BASE_URL,
+      defaultHeaders: {
+        originator: ORIGIN,
+        version: CLI_VERSION,
+        session_id: this.sessionId,
+      },
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+    });
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
+    
+    // Start provider initialization in constructor
+    this.providerInitialized = this.initializeProvider();
 
     this.hardAbort = new AbortController();
 
@@ -259,14 +318,6 @@ export class AgentLoop {
   private async handleFunctionCall(
     item: ResponseFunctionToolCall,
   ): Promise<Array<ResponseInputItem>> {
-    // DIAGNOSTIC - Log the incoming item at the beginning
-    console.error(`HANDLE FUNCTION CALL - Raw item: ${JSON.stringify({
-      type: (item as any).type,
-      id: (item as any).id,
-      call_id: (item as any).call_id,
-      function: (item as any).function ? true : false
-    })}`);
-    
     // If the agent has been canceled in the meantime we should not perform any
     // additional work. Returning an empty array ensures that we neither execute
     // the requested tool call nor enqueue any follow‑up input items. This keeps
@@ -306,12 +357,6 @@ export class AgentLoop {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callId: string = (item as any).call_id ?? (item as any).id;
 
-    console.error(`HANDLE FUNCTION CALL - Name: ${name}, CallId: ${callId}`);
-    
-    if (isLoggingEnabled()) {
-      log(`Using call ID: ${callId} for function call`);
-    }
-
     const args = parseToolCallArguments(rawArguments ?? "{}");
     if (isLoggingEnabled()) {
       log(
@@ -324,7 +369,7 @@ export class AgentLoop {
     if (args == null) {
       const outputItem: ResponseInputItem.FunctionCallOutput = {
         type: "function_call_output",
-        call_id: callId,
+        call_id: item.call_id,
         output: `invalid arguments: ${rawArguments}`,
       };
       return [outputItem];
@@ -373,42 +418,7 @@ export class AgentLoop {
       }
     }
 
-    // Make sure all output items have proper call_id for reliability
-    const results = [outputItem, ...additionalItems];
-    if (isLoggingEnabled()) {
-      log(`Function call with ID ${callId} produced ${results.length} output items`);
-      for (const result of results) {
-        if (result.type === "function_call_output") {
-          log(`Function call output: call_id=${result.call_id}, length=${result.output?.length || 0}`);
-        }
-      }
-    }
-
-    // DIAGNOSTIC - Log the results before modification
-    console.error(`HANDLE FUNCTION CALL - Results before ID fix: ${JSON.stringify(results.map(r => ({
-      type: r.type,
-      call_id: (r as any).call_id
-    })))}`);
-
-    // Ensure all output items have the correct call_id
-    const finalResults = results.map(item => {
-      if (item.type === "function_call_output") {
-        const fixedItem = {
-          ...item,
-          call_id: callId
-        };
-        console.error(`HANDLE FUNCTION CALL - Fixed output item: type=${fixedItem.type}, call_id=${fixedItem.call_id}`);
-        return fixedItem;
-      }
-      return item;
-    });
-    
-    console.error(`HANDLE FUNCTION CALL - Final results: ${JSON.stringify(finalResults.map(r => ({
-      type: r.type,
-      call_id: (r as any).call_id
-    })))}`);
-    
-    return finalResults;
+    return [outputItem, ...additionalItems];
   }
 
   public async run(
@@ -453,12 +463,6 @@ export class AgentLoop {
       // `MaxListenersExceededWarning` after ten invocations.
 
       let lastResponseId: string = previousResponseId;
-      
-      if (previousResponseId) {
-        console.error(`Starting with previous response ID: ${previousResponseId}`);
-      } else {
-        console.error(`No previous response ID provided`);
-      }
 
       // If there are unresolved function calls from a previously cancelled run
       // we have to emit dummy tool outputs so that the API no longer expects
@@ -520,17 +524,25 @@ export class AgentLoop {
           this.onLoading(false);
           return;
         }
-        // send request to openAI
+        // send request to model provider
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        
+        // Send request to the appropriate provider
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
         const MAX_RETRIES = 5;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
+            let reasoning: Reasoning | undefined;
+            if (this.model.startsWith("o")) {
+              reasoning = { effort: "high" };
+              if (this.model === "o3" || this.model === "o4-mini") {
+                reasoning.summary = "auto";
+              }
+            }
             const mergedInstructions = [prefix, this.instructions]
               .filter(Boolean)
               .join("\n");
@@ -540,41 +552,276 @@ export class AgentLoop {
               );
             }
             
-                    // Use model adapter to create stream
-            // eslint-disable-next-line no-await-in-loop
-            stream = await this.modelAdapter.createStream(
-              turnInput,
-              mergedInstructions,
-              lastResponseId
-            );
-            break;
+            // If we're using Claude or another non-OpenAI model, use the provider architecture
+            // Otherwise, fall back to direct OpenAI client for backward compatibility
+            if (this.modelProvider !== ModelProvider.OPENAI) {
+              // Make sure provider is initialized
+              await this.providerInitialized;
+              
+              if (!this.provider) {
+                throw new Error(`Provider not initialized for model ${this.model}`);
+              }
+              
+              // Providers don't support streaming yet, so we use the non-streaming API
+              const response = await this.provider.sendMessage(turnInput, {
+                system: mergedInstructions,
+                reasoning,
+                previousResponseId: lastResponseId || undefined,
+              });
+              
+              // Process the response
+              for (const item of response.items) {
+                stageItem(item);
+              }
+              
+              // Update response ID
+              lastResponseId = response.response_id;
+              this.onLastResponseId(response.response_id);
+              
+              // PROVIDER-AGNOSTIC: Check if the provider requires tool processing
+              // This delegates the decision to each provider implementation 
+              if (this.provider && typeof this.provider.requiresToolProcessing === 'function' && 
+                  this.provider.requiresToolProcessing(response)) {
+                if (isLoggingEnabled()) {
+                  log(`Provider ${this.provider.provider} requires tool processing - continuing the loop to process tool result`);
+                }
+                
+                // Extract tool calls from the response and process them
+                const functionCalls = response.items.filter(item => item.type === "function_call");
+                
+                if (isLoggingEnabled()) {
+                  log(`Found ${functionCalls.length} function calls to process`);
+                }
+                
+                // We need to clear turnInput first, then populate it with tool results
+                turnInput = [];
+                
+                // Process each function call and get the results
+                for (const functionCall of functionCalls) {
+                  // eslint-disable-next-line no-await-in-loop
+                  const result = await this.handleFunctionCall(functionCall);
+                  turnInput.push(...result);
+                  
+                  if (isLoggingEnabled()) {
+                    log(`Processed function call ${functionCall.name}, got ${result.length} result items`);
+                  }
+                }
+                
+                if (isLoggingEnabled()) {
+                  log(`Continuing loop with ${turnInput.length} tool results for ${this.provider.provider}`);
+                }
+                
+                // IMPORTANT: We must continue the loop with the tool results
+                // For the tool use flow to complete properly
+                continue; // Use continue instead of break to ensure loop continues
+              } else {
+                // Normal case or other provider - exit the loop
+                turnInput = [];
+                break;
+              }
+            } else {
+              // Use direct OpenAI client for backward compatibility
+              // eslint-disable-next-line no-await-in-loop
+              stream = await this.oai.responses.create({
+                model: this.model,
+                instructions: mergedInstructions,
+                previous_response_id: lastResponseId || undefined,
+                input: turnInput,
+                stream: true,
+                parallel_tool_calls: false,
+                reasoning,
+                tools: [
+                  {
+                    type: "function",
+                    name: "shell",
+                    description: "Runs a shell command, and returns its output.",
+                    strict: false,
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        command: { type: "array", items: { type: "string" } },
+                        workdir: {
+                          type: "string",
+                          description: "The working directory for the command.",
+                        },
+                        timeout: {
+                          type: "number",
+                          description:
+                            "The maximum time to wait for the command to complete in milliseconds.",
+                        },
+                      },
+                      required: ["command"],
+                      additionalProperties: false,
+                    },
+                  },
+                ],
+              });
+              break;
+            }
           } catch (error) {
-            // First check if the provider adapter can handle this error
-            const errorHandled = this.modelAdapter.handleProviderError(
-              error,
-              this.onItem,
-              this.onLoading
-            );
-            
-            if (errorHandled) {
-              // If the provider handled the error, we can continue or return
+            const isTimeout = error instanceof APIConnectionTimeoutError;
+            // Lazily look up the APIConnectionError class at runtime to
+            // accommodate the test environment's minimal OpenAI mocks which
+            // do not define the class.  Falling back to `false` when the
+            // export is absent ensures the check never throws.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ApiConnErrCtor = (OpenAI as any).APIConnectionError as  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              | (new (...args: any) => Error)
+              | undefined;
+            const isConnectionError = ApiConnErrCtor
+              ? error instanceof ApiConnErrCtor
+              : false;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const errCtx = error as any;
+            const status =
+              errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
+            const isServerError = typeof status === "number" && status >= 500;
+            if (
+              (isTimeout || isServerError || isConnectionError) &&
+              attempt < MAX_RETRIES
+            ) {
+              log(
+                `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
+              );
+              continue;
+            }
+
+            const isTooManyTokensError =
+              (errCtx.param === "max_tokens" ||
+                (typeof errCtx.message === "string" &&
+                  /max_tokens is too large/i.test(errCtx.message))) &&
+              errCtx.type === "invalid_request_error";
+
+            if (isTooManyTokensError) {
+              this.onItem({
+                id: `error-${Date.now()}`,
+                type: "message",
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    text: "⚠️  The current request exceeds the maximum context length supported by the chosen model. Please shorten the conversation, run /clear, or switch to a model with a larger context window and try again.",
+                  },
+                ],
+              });
+              this.onLoading(false);
+              return;
+            }
+
+            const isRateLimit =
+              status === 429 ||
+              errCtx.code === "rate_limit_exceeded" ||
+              errCtx.type === "rate_limit_exceeded" ||
+              /rate limit/i.test(errCtx.message ?? "");
+            if (isRateLimit) {
               if (attempt < MAX_RETRIES) {
+                // Exponential backoff: base wait * 2^(attempt-1), or use suggested retry time
+                // if provided.
+                let delayMs = RATE_LIMIT_RETRY_WAIT_MS * 2 ** (attempt - 1);
+
+                // Parse suggested retry time from error message, e.g., "Please try again in 1.3s"
+                const msg = errCtx?.message ?? "";
+                const m = /(?:retry|try) again in ([\d.]+)s/i.exec(msg);
+                if (m && m[1]) {
+                  const suggested = parseFloat(m[1]) * 1000;
+                  if (!Number.isNaN(suggested)) {
+                    delayMs = suggested;
+                  }
+                }
                 log(
-                  `Provider request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
+                  `OpenAI rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
+                    delayMs,
+                  )} ms...`,
                 );
                 // eslint-disable-next-line no-await-in-loop
-                await new Promise((resolve) => setTimeout(resolve, RATE_LIMIT_RETRY_WAIT_MS));
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
                 continue;
               } else {
-                return; // Exit if we've exhausted retries
+                // We have exhausted all retry attempts. Surface a message so the user understands
+                // why the request failed and can decide how to proceed (e.g. wait and retry later
+                // or switch to a different model / account).
+
+                const errorDetails = [
+                  `Status: ${status || "unknown"}`,
+                  `Code: ${errCtx.code || "unknown"}`,
+                  `Type: ${errCtx.type || "unknown"}`,
+                  `Message: ${errCtx.message || "unknown"}`,
+                ].join(", ");
+
+                this.onItem({
+                  id: `error-${Date.now()}`,
+                  type: "message",
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `⚠️  Rate limit reached. Error details: ${errorDetails}. Please try again later.`,
+                    },
+                  ],
+                });
+
+                this.onLoading(false);
+                return;
               }
             }
-            
-            // If the provider didn't handle it, rethrow the error
+
+            const isClientError =
+              (typeof status === "number" &&
+                status >= 400 &&
+                status < 500 &&
+                status !== 429) ||
+              errCtx.code === "invalid_request_error" ||
+              errCtx.type === "invalid_request_error";
+            if (isClientError) {
+              this.onItem({
+                id: `error-${Date.now()}`,
+                type: "message",
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    // Surface the request ID when it is present on the error so users
+                    // can reference it when contacting support or inspecting logs.
+                    text: (() => {
+                      const reqId =
+                        (
+                          errCtx as Partial<{
+                            request_id?: string;
+                            requestId?: string;
+                          }>
+                        )?.request_id ??
+                        (
+                          errCtx as Partial<{
+                            request_id?: string;
+                            requestId?: string;
+                          }>
+                        )?.requestId;
+
+                      const errorDetails = [
+                        `Status: ${status || "unknown"}`,
+                        `Code: ${errCtx.code || "unknown"}`,
+                        `Type: ${errCtx.type || "unknown"}`,
+                        `Message: ${errCtx.message || "unknown"}`,
+                      ].join(", ");
+
+                      return `⚠️  OpenAI rejected the request${
+                        reqId ? ` (request ID: ${reqId})` : ""
+                      }. Error details: ${errorDetails}. Please verify your settings and try again.`;
+                    })(),
+                  },
+                ],
+              });
+              this.onLoading(false);
+              return;
+            }
             throw error;
           }
         }
-        turnInput = []; // clear turn input, prepare for function call results
+        // Only clear the turn input if we're not handling a provider-specific tool call flow
+        // For providers that need tool processing, we would have already set turnInput in the continue case above
+        if (!turnInput.length) {
+          turnInput = []; // clear turn input, prepare for function call results
+        }
 
         // If the user requested cancellation while we were awaiting the network
         // request, abort immediately before we start handling the stream.
@@ -605,153 +852,50 @@ export class AgentLoop {
           // eslint-disable-next-line no-await-in-loop
           for await (const event of stream) {
             if (isLoggingEnabled()) {
-              log(`AgentLoop.run(): response event ${(event as any)['type']}`);
+              log(`AgentLoop.run(): response event ${event.type}`);
             }
 
-            // Direct handling of event.item.type === "function_call" for maximum compatibility
-            // This is critical for making tool calls work correctly with OpenAI
-            const isToolCall = (event as any)['type'] === "response.output_item.done" && 
-                              (event as any)['item'] && 
-                              (event as any)['item']['type'] === "function_call";
-                              
-            if (isToolCall) {
-              console.error("DIRECT PROCESSING of function_call event");
-              
-              // Get the item directly from the event
-              const item = (event as any)['item'];
-              
-              // Extract the call ID - CRITICAL for matching later
-              const callId = item.call_id ?? item.id;
-              console.error(`Function call received with ID: ${callId}`);
-              
-              // Track it for potential abort
-              if (callId) {
-                this.pendingAborts.add(callId);
-                console.error(`Added ${callId} to pendingAborts`);
+            // process and surface each item (no‑op until we can depend on streaming events)
+            if (event.type === "response.output_item.done") {
+              const item = event.item;
+              // 1) if it's a reasoning item, annotate it
+              type ReasoningItem = { type?: string; duration_ms?: number };
+              const maybeReasoning = item as ReasoningItem;
+              if (maybeReasoning.type === "reasoning") {
+                maybeReasoning.duration_ms = Date.now() - thinkingStart;
               }
-              
-              // Stage the item directly
-              stageItem(item);
-              
-            } else if ((event as any)['type'] === "response.output_item.done") {
-              // Normal handling for non-function_call items
-              const processedItem = this.modelAdapter.processStreamEvent(
-                event as Record<string, unknown>,
-                lastResponseId,
-                thinkingStart
-              );
-              
-              if (processedItem) {
-                if (processedItem.type === "function_call") {
-                  // Track outstanding tool call so we can abort later if needed.
-                  const callId =
-                    (processedItem as { call_id?: string; id?: string }).call_id ??
-                    (processedItem as { id?: string }).id;
-                  if (callId) {
-                    this.pendingAborts.add(callId);
-                  }
-                } else {
-                  stageItem(processedItem);
+              if (item.type === "function_call") {
+                // Track outstanding tool call so we can abort later if needed.
+                // The item comes from the streaming response, therefore it has
+                // either `id` (chat) or `call_id` (responses) – we normalise
+                // by reading both.
+                const callId =
+                  (item as { call_id?: string; id?: string }).call_id ??
+                  (item as { id?: string }).id;
+                if (callId) {
+                  this.pendingAborts.add(callId);
                 }
+              } else {
+                stageItem(item as ResponseItem);
               }
             }
 
-            if ((event as any)['type'] === "response.completed") {
-              const response = (event as any)['response'];
-              if (thisGeneration === this.generation && !this.canceled && response?.output) {
-                for (const item of response.output) {
+            if (event.type === "response.completed") {
+              if (thisGeneration === this.generation && !this.canceled) {
+                for (const item of event.response.output) {
                   stageItem(item as ResponseItem);
                 }
               }
-              
-              // Handle "requires_action" status - provider-agnostic pattern
-              // This generic pattern works for any provider that needs an additional request after a tool call
-              if (response?.status === "requires_action" && response?.requires_action?.type === "submit_tool_outputs") {
-                if (response.requires_action.tool_calls && response.requires_action.tool_calls.length > 0) {
-                  // Log the event for debugging
-                  console.error(`Processing requires_action with ${response.requires_action.tool_calls.length} tool calls`);
-                  console.error(`Using response ID: ${response?.id || 'unknown'}`);
-                  
-                  // Process all tool calls and collect their outputs
-                  const toolOutputs = [];
-                  
-                  for (const toolCall of response.requires_action.tool_calls) {
-                    try {
-                      // Get the tool call ID, critical for properly tracking tool calls
-                    const toolCallId = toolCall.id || toolCall.call_id;
-                    console.error(`Processing tool call: ${toolCall.name || 'unnamed'}, ID: ${toolCallId || 'unknown'}`);
-                    
-                    // Check if we've already processed this exact tool call ID to prevent infinite loops
-                    if (toolCallId && this.alreadyProcessedResponses.has(toolCallId)) {
-                      console.error(`SKIPPING already processed tool call ID: ${toolCallId} to prevent infinite loop`);
-                      continue;
-                    }
-                    
-                    // Mark this tool call as processed to prevent loops
-                    if (toolCallId) {
-                      this.alreadyProcessedResponses.add(toolCallId);
-                    }
-                    
-                    // Execute the tool and get results, completely provider-agnostic
-                    const callResults = await this.handleFunctionCall(toolCall);
-                      
-                      // Ensure call_id is properly set on all outputs
-                      const processedResults = callResults.map(result => {
-                        if (result.type === "function_call_output") {
-                          return {
-                            ...result,
-                            call_id: toolCall.id || toolCall.call_id
-                          };
-                        }
-                        return result;
-                      });
-                      
-                      toolOutputs.push(...processedResults);
-                      
-                      console.error(`Tool call processed, got ${processedResults.length} results`);
-                    } catch (toolError) {
-                      console.error(`Error processing tool call: ${toolError}`);
-                    }
-                  }
-                  
-                  // If we have tool outputs, continue the conversation
-                  if (toolOutputs.length > 0) {
-                    // Log for debugging 
-                    console.error(`Continuing conversation with ${toolOutputs.length} tool outputs`);
-                    
-                    // Use the tool outputs as the next turn input
-                    turnInput = [...toolOutputs];
-                    
-                    // Save response ID to maintain conversation context - CRITICAL for Claude 3.7
-                    if (response?.id) {
-                      lastResponseId = response.id;
-                      console.error(`Setting lastResponseId to ${response.id} for continuation`);
-                      this.onLastResponseId(response.id);
-                    }
-                    
-                    // Continue the loop to make a new request with the tool results
-                    continue;
-                  }
-                }
-              }
-              else if (response?.status === "completed" && response?.output) {
-                // Normal processing for completed responses
+              if (event.response.status === "completed") {
                 // TODO: remove this once we can depend on streaming events
                 const newTurnInput = await this.processEventsWithoutStreaming(
-                  response.output,
+                  event.response.output,
                   stageItem,
                 );
                 turnInput = newTurnInput;
               }
-              
-              if (response?.id) {
-                lastResponseId = response.id;
-                
-                // DIAGNOSTIC - Log the response ID
-                console.error(`RESPONSE ID set to: ${response.id}`);
-                
-                this.onLastResponseId(response.id);
-              }
+              lastResponseId = event.response.id;
+              this.onLastResponseId(event.response.id);
             }
           }
         } catch (err: unknown) {
@@ -770,11 +914,13 @@ export class AgentLoop {
           this.currentStream = null;
         }
 
-        log(
-          `Turn inputs (${turnInput.length}) - ${turnInput
-            .map((i) => i.type)
-            .join(", ")}`,
-        );
+        if (isLoggingEnabled()) {
+          log(
+            `Turn inputs (${turnInput.length}) - ${turnInput
+              .map((i) => i.type)
+              .join(", ")}`,
+          );
+        }
       }
 
       // Flush staged items if the run concluded successfully (i.e. the user did
@@ -889,41 +1035,151 @@ export class AgentLoop {
       // resolve gracefully so callers can choose to retry.
       // -------------------------------------------------------------------
 
-      // We use the model adapter for error handling now
+      const NETWORK_ERRNOS = new Set([
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "EPIPE",
+        "ENOTFOUND",
+        "ETIMEDOUT",
+        "EAI_AGAIN",
+      ]);
 
-      // We don't need this anymore as we're using the model adapter for error handling
+      const isNetworkOrServerError = (() => {
+        if (!err || typeof err !== "object") {
+          return false;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const e: any = err;
 
-      // Try to handle the error with the model adapter
-      const errorHandled = this.modelAdapter.handleProviderError(
-        err,
-        this.onItem,
-        this.onLoading
-      );
-      
-      if (errorHandled) {
+        // Direct instance check for connection errors thrown by the OpenAI SDK.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ApiConnErrCtor = (OpenAI as any).APIConnectionError as  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          | (new (...args: any) => Error)
+          | undefined;
+        if (ApiConnErrCtor && e instanceof ApiConnErrCtor) {
+          return true;
+        }
+
+        if (typeof e.code === "string" && NETWORK_ERRNOS.has(e.code)) {
+          return true;
+        }
+
+        // When the OpenAI SDK nests the underlying network failure inside the
+        // `cause` property we surface it as well so callers do not see an
+        // unhandled exception for errors like ENOTFOUND, ECONNRESET …
+        if (
+          e.cause &&
+          typeof e.cause === "object" &&
+          NETWORK_ERRNOS.has((e.cause as { code?: string }).code ?? "")
+        ) {
+          return true;
+        }
+
+        if (typeof e.status === "number" && e.status >= 500) {
+          return true;
+        }
+
+        // Fallback to a heuristic string match so we still catch future SDK
+        // variations without enumerating every errno.
+        if (
+          typeof e.message === "string" &&
+          /network|socket|stream/i.test(e.message)
+        ) {
+          return true;
+        }
+
+        return false;
+      })();
+
+      if (isNetworkOrServerError) {
+        try {
+          const msgText =
+            "⚠️  Network error while contacting OpenAI. Please check your connection and try again.";
+          this.onItem({
+            id: `error-${Date.now()}`,
+            type: "message",
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: msgText,
+              },
+            ],
+          });
+        } catch {
+          /* best‑effort */
+        }
+        this.onLoading(false);
         return;
       }
-      
-      // If the model adapter couldn't handle it, fall back to generic error handling
-      try {
-        const msgText =
-          "⚠️  An error occurred while contacting the model provider. Please check your connection and try again.";
-        this.onItem({
-          id: `error-${Date.now()}`,
-          type: "message",
-          role: "system",
-          content: [
-            {
-              type: "input_text",
-              text: msgText,
-            },
-          ],
-        });
-      } catch {
-        /* best‑effort */
+
+      const isInvalidRequestError = () => {
+        if (!err || typeof err !== "object") {
+          return false;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const e: any = err;
+
+        if (
+          e.type === "invalid_request_error" &&
+          e.code === "model_not_found"
+        ) {
+          return true;
+        }
+
+        if (
+          e.cause &&
+          e.cause.type === "invalid_request_error" &&
+          e.cause.code === "model_not_found"
+        ) {
+          return true;
+        }
+
+        return false;
+      };
+
+      if (isInvalidRequestError()) {
+        try {
+          // Extract request ID and error details from the error object
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const e: any = err;
+
+          const reqId =
+            e.request_id ??
+            (e.cause && e.cause.request_id) ??
+            (e.cause && e.cause.requestId);
+
+          const errorDetails = [
+            `Status: ${e.status || (e.cause && e.cause.status) || "unknown"}`,
+            `Code: ${e.code || (e.cause && e.cause.code) || "unknown"}`,
+            `Type: ${e.type || (e.cause && e.cause.type) || "unknown"}`,
+            `Message: ${
+              e.message || (e.cause && e.cause.message) || "unknown"
+            }`,
+          ].join(", ");
+
+          const msgText = `⚠️  OpenAI rejected the request${
+            reqId ? ` (request ID: ${reqId})` : ""
+          }. Error details: ${errorDetails}. Please verify your settings and try again.`;
+
+          this.onItem({
+            id: `error-${Date.now()}`,
+            type: "message",
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: msgText,
+              },
+            ],
+          });
+        } catch {
+          /* best-effort */
+        }
+        this.onLoading(false);
+        return;
       }
-      this.onLoading(false);
-      return;
 
       // Re‑throw all other errors so upstream handlers can decide what to do.
       throw err;
@@ -942,104 +1198,19 @@ export class AgentLoop {
     if (this.canceled) {
       return [];
     }
-    
-    if (isLoggingEnabled()) {
-      log(`Processing events without streaming: ${output.length} items`);
-      log(`Output types: ${output.map(item => item.type).join(', ')}`);
-    }
-    
     const turnInput: Array<ResponseInputItem> = [];
     for (const item of output) {
-      if (isLoggingEnabled()) {
-        const itemId = (item as any).id || (item as any).call_id || 'unknown';
-        log(`Processing item of type: ${item.type}, id: ${itemId}`);
-      }
-      
       if (item.type === "function_call") {
-        // Extract the call ID - OpenAI items may have different ID field names
-        const callId: string = (item as any).call_id ?? (item as any).id;
-        
-        if (callId && this.alreadyProcessedResponses.has(callId)) {
-          if (isLoggingEnabled()) {
-            log(`Skipping already processed function call: ${callId}`);
-          }
+        if (alreadyProcessedResponses.has(item.id)) {
           continue;
         }
-        
-        // Make sure the item has both id and call_id set (for backward compatibility)
-        const normalizedItem = {...item};
-        if (callId) {
-          (normalizedItem as any).id = callId;
-          (normalizedItem as any).call_id = callId;
-          
-          if (isLoggingEnabled()) {
-            log(`Processing function call with ID: ${callId}`);
-          }
-        } else {
-          log(`Warning: Function call without ID!`);
-        }
-        
-        // Try both approaches to see what's happening
-        const useDirect = true;
-        
-        // Log the input to handleFunctionCall for diagnostic purposes
-        console.error(`DIAGNOSTIC - Function call object: ${JSON.stringify({
-          type: normalizedItem.type,
-          id: (normalizedItem as any).id,
-          call_id: (normalizedItem as any).call_id,
-        })}`);
-        
+        alreadyProcessedResponses.add(item.id);
         // eslint-disable-next-line no-await-in-loop
-        let result;
-        if (useDirect) {
-          // Use the direct approach
-          result = await this.handleFunctionCall(normalizedItem as ResponseFunctionToolCall);
-        } else {
-          // Use the adapter approach
-          result = await this.modelAdapter.processToolCall(
-            normalizedItem as ResponseItem,
-            this.handleFunctionCall.bind(this)
-          );
-        }
-        
-        // Log the results
-        if (result && result.length > 0) {
-          for (const item of result) {
-            if (item.type === "function_call_output") {
-              console.error(`DIAGNOSTIC - Output item call_id: ${item.call_id}, type: ${item.type}`);
-            }
-          }
-        }
-        
-        if (isLoggingEnabled()) {
-          log(`Function call result: ${result.length} items`);
-        }
-        
-        // Save ID to processed set if it exists
-        if (callId) {
-          this.alreadyProcessedResponses.add(callId);
-        }
-        
-        // Make sure all results have the call_id set correctly
-        const processedResults = result.map(outputItem => {
-          if (outputItem.type === "function_call_output" && callId) {
-            return {
-              ...outputItem,
-              call_id: callId
-            };
-          }
-          return outputItem;
-        });
-        
-        turnInput.push(...processedResults);
+        const result = await this.handleFunctionCall(item);
+        turnInput.push(...result);
       }
       emitItem(item as ResponseItem);
     }
-    
-    if (isLoggingEnabled()) {
-      log(`Processed events returned ${turnInput.length} new turn inputs`);
-    }
-    
     return turnInput;
   }
 }

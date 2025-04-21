@@ -27,7 +27,11 @@ import { createInputItem } from "./utils/input-utils";
 import {
   isModelSupportedForResponses,
   preloadModels,
+<<<<<<< HEAD
   resolveModel
+=======
+  normalizeModelName,
+>>>>>>> stable-ui
 } from "./utils/model-utils.js";
 import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
@@ -221,15 +225,24 @@ if (cli.flags.config) {
 // ---------------------------------------------------------------------------
 
 const apiKey = process.env["OPENAI_API_KEY"];
+const anthropicApiKey = process.env["ANTHROPIC_API_KEY"];
 
-if (!apiKey) {
+// If user specified a model, determine which provider it uses
+const modelFromArgs = cli.flags.model as string | undefined;
+const usesClaude = modelFromArgs && modelFromArgs.toLowerCase().includes('claude');
+
+// Only require the appropriate API key based on the model
+if (!apiKey && (!usesClaude || !anthropicApiKey)) {
   // eslint-disable-next-line no-console
   console.error(
-    `\n${chalk.red("Missing OpenAI API key.")}\n\n` +
+    `\n${chalk.red("Missing API key.")}\n\n` +
       `Set the environment variable ${chalk.bold("OPENAI_API_KEY")} ` +
-      `and re-run this command.\n` +
-      `You can create a key here: ${chalk.bold(
+      `for OpenAI models or ${chalk.bold("ANTHROPIC_API_KEY")} for Claude models.\n` +
+      `You can create an OpenAI key here: ${chalk.bold(
         chalk.underline("https://platform.openai.com/account/api-keys"),
+      )}\n` +
+      `You can create an Anthropic key here: ${chalk.bold(
+        chalk.underline("https://console.anthropic.com/settings/keys"),
       )}\n`,
   );
   process.exit(1);
@@ -244,7 +257,9 @@ let config = loadConfig(undefined, undefined, {
 });
 
 const prompt = cli.input[0];
-let model = cli.flags.model;
+const rawModel = cli.flags.model as string | undefined;
+// Normalize the model name if provided, especially for Claude models
+const model = rawModel ? normalizeModelName(rawModel) : undefined;
 const imagePaths = cli.flags.image as Array<string> | undefined;
 
 // Apply model resolution for user-friendly aliases
@@ -257,6 +272,9 @@ if (model) {
 
 config = {
   apiKey,
+  anthropicApiKey,
+  openaiBaseUrl: process.env.OPENAI_BASE_URL || undefined,
+  anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || undefined,
   ...config,
   model: model ?? config.model,
   notify: Boolean(cli.flags.notify),
@@ -269,10 +287,11 @@ await checkForUpdates().catch();
 if (!(await isModelSupportedForResponses(config.model))) {
   // eslint-disable-next-line no-console
   console.error(
-    `The model "${config.model}" does not appear in the list of models ` +
-      `available to your account. Double‑check the spelling (use\n` +
-      `  openai models list\n` +
-      `to see the full list) or choose another model with the --model flag.`,
+    `The model "${config.model}" does not appear in the list of supported models. ` +
+      `Double‑check the spelling or choose another model with the --model flag.\n\n` +
+      `Supported models:\n` +
+      `- OpenAI models: Use 'openai models list' to see available models\n` +
+      `- Claude models: claude-3, claude-3.5, claude-3.7, etc.`,
   );
   process.exit(1);
 }

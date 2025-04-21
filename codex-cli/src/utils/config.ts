@@ -51,6 +51,10 @@ export function setApiKey(apiKey: string, provider: string = "openai"): void {
   }
 }
 
+export function setAnthropicApiKey(apiKey: string): void {
+  ANTHROPIC_API_KEY = apiKey;
+}
+
 // Formatting (quiet mode-only).
 export const PRETTY_PRINT = Boolean(process.env["PRETTY_PRINT"] || "");
 
@@ -89,6 +93,9 @@ export type MemoryConfig = {
 // Represents full runtime config, including loaded instructions.
 export type AppConfig = {
   apiKey?: string;
+  anthropicApiKey?: string;
+  openaiBaseUrl?: string;
+  anthropicBaseUrl?: string;
   model: string;
   instructions: string;
   fullAutoErrorMode?: FullAutoErrorMode;

@@ -1,5 +1,5 @@
-export const CLI_VERSION = "0.1.3-beta.27"; // Must be in sync with package.json.
-export const ORIGIN = "codex_plus_cli_ts";
+export const CLI_VERSION = "1.0.0-beta.25"; // Must be in sync with package.json.
+export const ORIGIN = "codex_plus";
 
 export type TerminalChatSession = {
   /** Globally unique session identifier */
